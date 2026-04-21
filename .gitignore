@@ -1,0 +1,73 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# WhatsApp Session Data
+.wwebjs_auth/
+.wwebjs_cache/
+session-data/
+*.data.json
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Secrets & Credentials
+google_calendar_credentials.json
+*.pem
+*.key
+*.p12
+credentials.json
+token.json
+
+# Build & Distribution
+dist/
+build/
+.cache/
+
+# Temporary Files
+tmp/
+temp/
+*.tmp
+
+# Test Coverage
+coverage/
+.nyc_output/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache

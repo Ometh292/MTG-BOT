@@ -1,0 +1,12 @@
+node_modules
+.wwebjs_auth
+.wwebjs_cache
+.env
+*.log
+.git
+.gitignore
+.github
+README.md
+docs
+test-*.js
+session

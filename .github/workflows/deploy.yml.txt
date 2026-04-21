@@ -1,0 +1,67 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      REMOTE_PATH: /opt/projects/washbot/
+      SKIP_SEED: ${{ github.event.inputs.skip_seed || '1' }} # default to skip
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Ensure known_hosts for VPS
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Warm up user ssh-agent on VPS
+        run: |
+          ssh "$SSH_USER@$SSH_HOST" 'bash -lc "
+            set -euo pipefail
+            # ensure agent service is up
+            systemctl --user is-active ssh-agent >/dev/null 2>&1 || systemctl --user start ssh-agent
+
+            # bind this shell to the persistent agent socket
+            export SSH_AUTH_SOCK=\${XDG_RUNTIME_DIR:-/run/user/\$UID}/ssh-agent.socket
+
+            # (optional) if agent has no keys, try adding common keys; will no-op if already added
+            ssh-add -l >/dev/null 2>&1 || ssh-add ~/.ssh/github_deploy_key ~/.ssh/id_ed25519 ~/.ssh/id_rsa >/dev/null 2>&1 || true
+
+            # ensure github.com host key exists on the VPS so git pull/builds don'\''t prompt
+            mkdir -p ~/.ssh
+            touch ~/.ssh/known_hosts
+            grep -q \"github.com\" ~/.ssh/known_hosts || ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          "'
+
+      - name: Deploy Application
+        run: |
+          ssh "$SSH_USER@$SSH_HOST" 'bash -lc "
+            set -euo pipefail
+            export SSH_AUTH_SOCK=\${XDG_RUNTIME_DIR:-/run/user/\$UID}/ssh-agent.socket
+
+            cd '"$REMOTE_PATH"'
+            # (optional) pull latest code if the server keeps a working tree
+            if [ -d .git ]; then
+              git pull --ff-only
+            fi
+
+            docker compose up -d --build
+
+            echo \"Cleaning up old Docker images and containers...\"
+            docker image prune -f
+            docker container prune -f
+            docker builder prune -f
+          "'
