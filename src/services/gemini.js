@@ -55,6 +55,26 @@ function extractText(response) {
 		.trim();
 }
 
+function extractJsonText(text) {
+	const value = String(text || "").trim();
+	if (!value) {
+		return "";
+	}
+
+	const fencedMatch = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (fencedMatch) {
+		return fencedMatch[1].trim();
+	}
+
+	const firstBrace = value.indexOf("{");
+	const lastBrace = value.lastIndexOf("}");
+	if (firstBrace >= 0 && lastBrace > firstBrace) {
+		return value.slice(firstBrace, lastBrace + 1).trim();
+	}
+
+	return value;
+}
+
 async function generateReply({ systemInstruction, history, message, config = {} }) {
 	ensureInitialized();
 
@@ -79,6 +99,25 @@ async function generateReply({ systemInstruction, history, message, config = {} 
 	};
 }
 
+async function generateJson({ systemInstruction, history, message, config = {} }) {
+	const response = await generateReply({
+		systemInstruction,
+		history,
+		message,
+		config: {
+			temperature: 0.1,
+			...config,
+		},
+	});
+
+	const jsonText = extractJsonText(response.text);
+	return {
+		data: JSON.parse(jsonText),
+		text: response.text,
+		raw: response.raw,
+	};
+}
+
 async function generateWithTools({
 	systemInstruction,
 	history,
@@ -94,6 +133,7 @@ async function generateWithTools({
 		...mapHistoryToContents(history),
 		{ role: "user", parts: [{ text: message }] },
 	];
+	const toolExecutions = [];
 
 	for (let iteration = 0; iteration < maxIterations; iteration += 1) {
 		const response = await client.models.generateContent({
@@ -115,12 +155,13 @@ async function generateWithTools({
 		});
 
 		const functionCalls = extractFunctionCalls(response);
-		if (!functionCalls.length) {
-			return {
-				text: extractText(response),
-				raw: response,
-			};
-		}
+			if (!functionCalls.length) {
+				return {
+					text: extractText(response),
+					raw: response,
+					toolExecutions,
+				};
+			}
 
 		contents.push({
 			role: "model",
@@ -153,6 +194,11 @@ async function generateWithTools({
 
 			try {
 				const result = await handler(call.args || {});
+				toolExecutions.push({
+					name: call.name,
+					args: call.args || {},
+					result,
+				});
 				functionResponses.push({
 					functionResponse: {
 						name: call.name,
@@ -163,6 +209,14 @@ async function generateWithTools({
 					},
 				});
 			} catch (error) {
+				toolExecutions.push({
+					name: call.name,
+					args: call.args || {},
+					result: {
+						success: false,
+						error: error.message,
+					},
+				});
 				functionResponses.push({
 					functionResponse: {
 						name: call.name,
@@ -190,5 +244,6 @@ async function generateWithTools({
 module.exports = {
 	initialize,
 	generateReply,
+	generateJson,
 	generateWithTools,
 };

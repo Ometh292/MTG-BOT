@@ -1,5 +1,4 @@
-const fs = require("fs");
-const path = require("path");
+const logger = require("../utils/logger");
 
 let runtimeConfig;
 
@@ -7,48 +6,53 @@ function initialize(config) {
 	runtimeConfig = config;
 }
 
-function getCategoryFiles(category) {
-	const root = runtimeConfig?.rag?.sourcePath;
-	if (!root || !fs.existsSync(root)) {
-		return [];
+function getRemoteConfig() {
+	const remote = runtimeConfig?.rag?.remote;
+	if (!remote || !remote.baseUrl) {
+		throw new Error("RAG remote config missing: set MOX_RAG_BASE_URL");
 	}
-
-	const directCandidates = [
-		path.join(root, `${category}.md`),
-		path.join(root, `${category}.txt`),
-	];
-
-	const nestedDir = path.join(root, category);
-	const nestedFiles = fs.existsSync(nestedDir)
-		? fs.readdirSync(nestedDir).map((name) => path.join(nestedDir, name))
-		: [];
-
-	return [...directCandidates, ...nestedFiles].filter((filePath) => fs.existsSync(filePath));
+	return remote;
 }
 
-function tokenize(value) {
-	return String(value || "")
-		.toLowerCase()
-		.split(/[^a-z0-9]+/)
-		.filter(Boolean);
+function buildRetrieveUrl(baseUrl) {
+	const trimmed = String(baseUrl).replace(/\/+$/, "");
+	return `${trimmed}/api/rag/retrieve`;
 }
 
-function scoreChunk(queryTokens, chunk) {
-	const chunkTokens = new Set(tokenize(chunk));
-	let score = 0;
-	for (const token of queryTokens) {
-		if (chunkTokens.has(token)) {
-			score += 1;
-		}
-	}
-	return score;
-}
-
-function splitIntoChunks(text) {
-	return String(text || "")
-		.split(/\n\s*\n/g)
+// Mox returns context as chunks joined by "\n\n---\n\n" (see
+// backend/src/services/rag/retrieval_service.py::_format_context).
+function splitContextIntoChunks(context) {
+	return String(context || "")
+		.split(/\n\n---\n\n/g)
 		.map((chunk) => chunk.trim())
 		.filter(Boolean);
+}
+
+async function postRetrieve({ baseUrl, query, tenantId, category, timeoutMs }) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+	try {
+		const response = await fetch(buildRetrieveUrl(baseUrl), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				query,
+				tenant_id: tenantId,
+				category: category || null,
+			}),
+			signal: controller.signal,
+		});
+
+		if (!response.ok) {
+			const body = await response.text().catch(() => "");
+			throw new Error(`Mox retrieve failed: ${response.status} ${body.slice(0, 200)}`);
+		}
+
+		return await response.json();
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 async function retrieveKnowledge(query, category) {
@@ -60,28 +64,28 @@ async function retrieveKnowledge(query, category) {
 		throw new Error(`Unsupported RAG category: ${category}`);
 	}
 
-	const files = getCategoryFiles(category);
-	const queryTokens = tokenize(query);
-	const matches = [];
+	const { baseUrl, tenantId, timeoutMs } = getRemoteConfig();
 
-	for (const filePath of files) {
-		const content = fs.readFileSync(filePath, "utf8");
-		const chunks = splitIntoChunks(content);
-
-		for (const chunk of chunks) {
-			const score = scoreChunk(queryTokens, chunk);
-			if (score > 0) {
-				matches.push({
-					category,
-					score,
-					source: filePath,
-					text: chunk,
-				});
-			}
-		}
+	let payload;
+	try {
+		payload = await postRetrieve({ baseUrl, query, tenantId, category, timeoutMs });
+	} catch (error) {
+		logger.error(`Mox RAG retrieve error: ${error.message}`);
+		return { success: false, category, matches: [] };
 	}
 
-	matches.sort((left, right) => right.score - left.score);
+	if (payload.status !== "success" || !payload.context) {
+		return { success: true, category, matches: [] };
+	}
+
+	const sourcesLabel = Array.isArray(payload.sources) ? payload.sources.join(", ") : "";
+	const chunks = splitContextIntoChunks(payload.context);
+	const matches = chunks.map((text, index) => ({
+		category,
+		score: chunks.length - index,
+		source: sourcesLabel,
+		text,
+	}));
 
 	return {
 		success: true,

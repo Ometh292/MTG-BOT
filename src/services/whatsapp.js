@@ -6,6 +6,7 @@ const path = require("path");
 const logger = require("../utils/logger");
 
 const SESSION_PATH = path.join(__dirname, "../../.wwebjs_auth");
+const WEB_CACHE_PATH = path.join(__dirname, "../../.wwebjs_cache");
 const MAX_RECONNECT_ATTEMPTS = 3;
 
 let reconnectAttempts = 0;
@@ -20,6 +21,16 @@ setInterval(() => processedMessages.clear(), 60 * 60 * 1000);
 function ensureSessionDirectory() {
 	if (!fs.existsSync(SESSION_PATH)) {
 		fs.mkdirSync(SESSION_PATH, { recursive: true, mode: 0o755 });
+	}
+}
+
+function clearVolatileCache() {
+	try {
+		if (fs.existsSync(WEB_CACHE_PATH)) {
+			fs.rmSync(WEB_CACHE_PATH, { recursive: true, force: true });
+		}
+	} catch (error) {
+		console.warn("Could not clear web cache:", error.message);
 	}
 }
 
@@ -57,10 +68,6 @@ function initializeClient(configuration, services) {
 			clientId: "mtg-store-session",
 			dataPath: SESSION_PATH,
 		}),
-		webVersionCache: {
-			type: "remote",
-			remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1018939634-alpha.html",
-		},
 		puppeteer: puppeteerConfig,
 	});
 
@@ -267,5 +274,6 @@ module.exports = {
 	sendMessage,
 	getStatus,
 	getClient,
+	clearVolatileCache,
 	setupShutdownHandlers,
 };

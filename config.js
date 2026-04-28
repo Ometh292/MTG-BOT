@@ -10,6 +10,26 @@ function parseBoolean(value, fallback = false) {
 	return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
+function getDefaultPuppeteerArgs() {
+	const baseArgs = [
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-accelerated-2d-canvas",
+		"--no-first-run",
+		"--disable-gpu",
+		"--disable-crashpad",
+	];
+
+	// These flags are helpful in many Linux container runtimes but can destabilize
+	// Chromium on desktop macOS during page context transitions.
+	if (process.platform === "linux") {
+		baseArgs.push("--no-zygote", "--single-process");
+	}
+
+	return baseArgs;
+}
+
 module.exports = {
 	storeInfo: {
 		name: "Mana Junction MTG Store",
@@ -17,6 +37,7 @@ module.exports = {
 		supportHours: "Tuesday-Sunday, 11:00 AM-8:00 PM",
 		timezone: process.env.STORE_TIMEZONE || "Asia/Colombo",
 		contactEmail: process.env.STORE_SUPPORT_EMAIL || "support@manajunction.example",
+		websiteUrl: process.env.STORE_WEBSITE_URL || "",
 	},
 
 	aiBot: {
@@ -52,6 +73,11 @@ module.exports = {
 		sourcePath: process.env.RAG_SOURCE_PATH || path.join(__dirname, "rag"),
 		categories: ["policies", "buylist"],
 		maxResults: Number(process.env.RAG_MAX_RESULTS || 3),
+		remote: {
+			baseUrl: process.env.MOX_RAG_BASE_URL || "http://localhost:8000",
+			tenantId: process.env.MOX_RAG_TENANT_ID || "default",
+			timeoutMs: Number(process.env.MOX_RAG_TIMEOUT_MS || 10000),
+		},
 	},
 
 	rulesGrounding: {
@@ -66,17 +92,7 @@ module.exports = {
 	},
 
 	client: {
-		puppeteerArgs: [
-			"--no-sandbox",
-			"--disable-setuid-sandbox",
-			"--disable-dev-shm-usage",
-			"--disable-accelerated-2d-canvas",
-			"--no-first-run",
-			"--no-zygote",
-			"--disable-gpu",
-			"--single-process",
-			"--disable-crashpad",
-		],
+		puppeteerArgs: getDefaultPuppeteerArgs(),
 		sessionPath: "./.wwebjs_auth",
 		executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null,
 	},

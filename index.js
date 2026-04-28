@@ -7,6 +7,43 @@ const geminiService = require("./src/services/gemini");
 const agentService = require("./src/services/agent");
 const expressService = require("./src/services/express");
 
+function isTransientWhatsAppInitError(error) {
+	const message = String(error && error.message ? error.message : error);
+	return (
+		message.includes("Execution context was destroyed")
+		|| message.includes("Cannot find context with specified id")
+		|| message.includes("Target closed")
+	);
+}
+
+async function initializeWhatsAppClientWithRetry(client, maxAttempts = 4) {
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			await client.initialize();
+			return;
+		} catch (error) {
+			const isTransient = isTransientWhatsAppInitError(error);
+			const canRetry = isTransient && attempt < maxAttempts;
+
+			if (!canRetry) {
+				throw error;
+			}
+
+			try {
+				await client.destroy();
+			} catch (_destroyError) {
+				// Ignore cleanup failures and continue with retry backoff.
+			}
+
+			console.warn(
+				`WhatsApp initialization attempt ${attempt}/${maxAttempts} failed with transient browser error. Retrying...`,
+			);
+			whatsappService.clearVolatileCache();
+			await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+		}
+	}
+}
+
 async function bootstrap() {
 	console.log("==================================================");
 	console.log("MTG Store WhatsApp Assistant");
@@ -33,7 +70,7 @@ async function bootstrap() {
 	});
 
 	console.log("Initializing WhatsApp client...\n");
-	await client.initialize();
+	await initializeWhatsAppClientWithRetry(client);
 
 	expressService.initializeServer(whatsappService, config);
 	console.log("All services initialized.\n");
