@@ -17,3 +17,7 @@ WhatsApp can provide event details, but event registration is not completed in c
 Voucher Policy
 
 Voucher and promo validity depends on the code, product category, and expiry window. Discounts may exclude preorders, allocations, and selected premium sealed items.
+
+Privacy Policy
+
+We respect your privacy. Contact information provided through WhatsApp is used only to facilitate customer service, order follow-ups, and event info. We do not sell or share your data with third-party advertisers. Personal data related to transactions is handled according to standard store security protocols.
