@@ -70,8 +70,8 @@ function getDefaultPuppeteerArgs() {
 
 module.exports = {
 	storeInfo: {
-		name: "Mana Junction MTG Store",
-		location: "Colombo, Sri Lanka",
+		name: "Mox & Lotus SG",
+		location: "Bedok North, Singapore",
 		supportHours: "Tuesday-Sunday, 11:00 AM-8:00 PM",
 		timezone: process.env.STORE_TIMEZONE || "Asia/Colombo",
 		contactEmail: process.env.STORE_SUPPORT_EMAIL || "support@manajunction.example",

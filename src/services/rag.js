@@ -140,57 +140,109 @@ async function buildIndex() {
 	indexReady = true;
 }
 
-// ─── public: retrieveKnowledge ─────────────────────────────────────────────────
-
 /**
  * Retrieve relevant knowledge chunks for a query.
- *
- * @param {string} query      - User's question
- * @param {string} category   - Category filter (e.g. "policies", "buylist")
- * @returns {{ success: boolean, category: string, matches: Array }}
  */
 async function retrieveKnowledge(query) {
 	if (!runtimeConfig) {
 		throw new Error("RAG service has not been initialized");
 	}
 
-	if (!indexReady || !vectorIndex) {
-		logger.warning("[RAG] Index not ready — returning empty matches");
-		return { success: false, matches: [] };
-	}
+	let vectorMatches = [];
+	
+	// 1. Try Vector Search first if index is ready
+	if (indexReady && vectorIndex) {
+		try {
+			await embeddingService.initialize();
+			const queryVector = await embeddingService.embedQuery(query);
+			const topK = (runtimeConfig.rag.maxResults || 3) * 4;
+			const results = await vectorIndex.queryItems(queryVector, topK);
 
-	try {
-		await embeddingService.initialize();
-
-		// Embed the query using RETRIEVAL_QUERY task type
-		const queryVector = await embeddingService.embedQuery(query);
-
-		// Similarity search — fetch more than needed so we have room to filter
-		const topK = (runtimeConfig.rag.maxResults || 3) * 4;
-		const results = await vectorIndex.queryItems(queryVector, topK);
-
-		// Filter by similarity threshold across ALL documents
-		const threshold = runtimeConfig.rag.similarityThreshold || 0.40;
-		const filtered = results
-			.filter((r) => r.score >= threshold)
-			.slice(0, runtimeConfig.rag.maxResults || 3);
-
-		if (!filtered.length) {
-			return { success: true, matches: [] };
+			const threshold = runtimeConfig.rag.similarityThreshold || 0.40;
+			vectorMatches = results
+				.filter((r) => r.score >= threshold)
+				.map((r) => ({
+					text: r.item.metadata.text,
+					source: r.item.metadata.source,
+					category: r.item.metadata.category,
+					score: Math.round(r.score * 1000) / 1000,
+					method: "vector"
+				}));
+		} catch (error) {
+			logger.error(`[RAG] Vector search error: ${error.message}`);
 		}
-
-		const matches = filtered.map((r) => ({
-			text: r.item.metadata.text,
-			source: r.item.metadata.source,
-			category: r.item.metadata.category,
-			score: Math.round(r.score * 1000) / 1000,
-		}));
-
-		return { success: true, matches };
-	} catch (error) {
-		logger.error(`[RAG] retrieveKnowledge error: ${error.message}`);
-		return { success: false, matches: [] };
 	}
+
+	// 2. If vector search found nothing or was skipped, try Keyword Search (The "Search Every File" Fallback)
+	if (vectorMatches.length === 0) {
+		logger.info(`[RAG] Vector search yielded no results for "${query}". Falling back to keyword search.`);
+		const keywordMatches = keywordSearch(query);
+		
+		if (keywordMatches.length > 0) {
+			return { success: true, matches: keywordMatches.slice(0, runtimeConfig.rag.maxResults || 3) };
+		}
+	} else {
+		return { success: true, matches: vectorMatches.slice(0, runtimeConfig.rag.maxResults || 3) };
+	}
+
+	return { success: true, matches: [] };
+}
+
+/**
+ * Simple case-insensitive keyword search across all markdown files.
+ * This is highly reliable for specific queries like "hours", "location", etc.
+ */
+function keywordSearch(query) {
+	const sourcePath = runtimeConfig.rag.sourcePath;
+	if (!fs.existsSync(sourcePath)) return [];
+
+	const normalizedQuery = query.toLowerCase();
+	const keywords = normalizedQuery.split(/\s+/).filter(w => w.length > 3);
+	
+	const mdFiles = fs
+		.readdirSync(sourcePath)
+		.filter((f) => f.endsWith(".md") && !f.startsWith("."))
+		.map((f) => path.join(sourcePath, f));
+
+	const matches = [];
+
+	for (const filePath of mdFiles) {
+		const content = fs.readFileSync(filePath, "utf8");
+		const source = path.basename(filePath, ".md");
+		const category = inferCategory(filePath);
+
+		// Check if query or main keywords appear in the file
+		const hasFullQuery = content.toLowerCase().includes(normalizedQuery);
+		const matchingKeywords = keywords.filter(k => content.toLowerCase().includes(k));
+		
+		if (hasFullQuery || matchingKeywords.length > 0) {
+			// Split by one or more newlines to be safe
+			const segments = content.split(/\n+/).map(s => s.trim()).filter(s => s.length > 10);
+			
+			for (const segment of segments) {
+				const lowerSegment = segment.toLowerCase();
+				if (lowerSegment.includes(normalizedQuery) || 
+					keywords.some(k => lowerSegment.includes(k))) {
+					
+					matches.push({
+						text: segment,
+						source,
+						category,
+						score: 0.95, // Manual matches get a high synthetic score
+						method: "keyword"
+					});
+					
+					if (matches.length >= 10) break;
+				}
+			}
+		}
+	}
+
+	if (matches.length > 0) {
+		logger.info(`[RAG] Keyword search found ${matches.length} potential matches for "${query}"`);
+	}
+
+	return matches.sort((a, b) => b.text.length - a.text.length);
 }
 
 // ─── text chunking ─────────────────────────────────────────────────────────────

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mox & Lotus — MTG Bot Assistant</title>
+    <meta name="description" content="Professional admin dashboard for the Mox & Lotus WhatsApp MTG Assistant">
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-glow"></div>
+    <div class="container">
+        <header class="header">
+            <div class="logo-container">
+                <div class="logo-icon">
+                    <!-- Custom MTG-themed lotus icon -->
+                    <svg width="40" height="40" viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="22" cy="22" r="22" fill="url(#brandGradient)" />
+                        <path d="M22 10C18 10 16 14 16 14C16 14 12 16 12 20C12 24 16 26 16 26C16 26 18 30 22 30C26 30 28 26 28 26C28 26 32 24 32 20C32 16 28 14 28 14C28 14 26 10 22 10Z" fill="white" fill-opacity="0.9" />
+                        <defs>
+                            <linearGradient id="brandGradient" x1="0" y1="0" x2="44" y2="44">
+                                <stop offset="0%" stop-color="#d4af37" />
+                                <stop offset="100%" stop-color="#8a6d3b" />
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                </div>
+                <div class="logo-text">
+                    <h1>Mox & Lotus</h1>
+                    <span class="logo-sub">WhatsApp Assistant Admin</span>
+                </div>
+            </div>
+            <div class="status-badge" id="statusBadge">
+                <span class="indicator"></span>
+                <span class="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <main class="dashboard-grid">
+            <!-- QR Code Section -->
+            <section class="card qr-card" id="qrCard" style="display: none;">
+                <div class="card-header">
+                    <h2>📱 WhatsApp Link</h2>
+                    <p>Scan the code to authorize the MTG Assistant</p>
+                </div>
+                <div class="qr-wrapper">
+                    <div class="qr-container" id="qrContainer">
+                        <!-- QR Image will be injected here -->
+                    </div>
+                </div>
+                <div class="qr-footer">
+                    <p id="qrStatus">Waiting for QR...</p>
+                </div>
+            </section>
+
+            <!-- Logs Section -->
+            <section class="card logs-card">
+                <div class="card-header">
+                    <div class="header-flex">
+                        <h2>📋 System Activity</h2>
+                        <div class="header-actions">
+                            <button id="clearLogs" class="btn-icon-text">
+                                <span>Clear</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div class="logs-viewport" id="logsContainer">
+                    <!-- Logs will appear here -->
+                </div>
+                <div class="logs-footer">
+                    <label class="toggle">
+                        <input type="checkbox" id="autoScroll" checked>
+                        <span class="slider"></span>
+                        <span class="label-text">Auto-scroll</span>
+                    </label>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
