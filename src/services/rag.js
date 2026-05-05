@@ -17,9 +17,27 @@
 
 const fs = require("fs");
 const path = require("path");
-const { LocalIndex } = require("vectra");
 const logger = require("../utils/logger");
 const embeddingService = require("./embedding_service");
+
+let LocalIndexClass = null;
+
+function getLocalIndexClass() {
+	if (LocalIndexClass) {
+		return LocalIndexClass;
+	}
+
+	try {
+		({ LocalIndex: LocalIndexClass } = require("vectra"));
+		return LocalIndexClass;
+	} catch (error) {
+		if (error && error.code === "MODULE_NOT_FOUND") {
+			throw new Error("RAG dependency 'vectra' is not installed. Run npm install to enable RAG indexing.");
+		}
+
+		throw error;
+	}
+}
 
 // ─── module state ──────────────────────────────────────────────────────────────
 let runtimeConfig = null;
@@ -50,6 +68,7 @@ async function buildIndex() {
 	const indexPath = runtimeConfig.rag.indexPath;
 
 	await embeddingService.initialize();
+	const LocalIndex = getLocalIndexClass();
 
 	// Create/open vectra index
 	vectorIndex = new LocalIndex(indexPath);
