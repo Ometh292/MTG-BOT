@@ -56,7 +56,8 @@ async function bootstrap() {
 		console.log(`Session memory enabled (limit: ${config.aiBot.memory.limit} messages)`);
 	}
 
-	await geminiService.initialize(process.env.GEMINI_API_KEY, config);
+	await geminiService.initialize(config);
+	console.log(`Gemini auth mode: ${geminiService.getActiveAuthMode()}`);
 	agentService.initialize({ config, historyManager, geminiService });
 
 	const client = whatsappService.initializeClient(config, {

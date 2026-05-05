@@ -1,7 +1,7 @@
 const storeTools = require("./store-tools");
 const ragService = require("./rag");
 const rulesGrounding = require("./rules-grounding");
-const { safeTextCleanup } = require("../utils/helpers");
+const { normalizeOrderCode, safeTextCleanup } = require("../utils/helpers");
 
 let runtimeConfig;
 let historyManager;
@@ -11,7 +11,27 @@ const GREETING_KEYWORDS = ["hi", "hello", "hey", "help", "menu"];
 const POLICY_KEYWORDS = ["policy", "policies", "return", "refund", "shipping", "pickup", "hours", "payment", "preorder", "pre-order", "hold", "store credit"];
 const BUYLIST_KEYWORDS = ["buylist", "sell cards", "sell my cards", "trade in", "collection", "bulk", "cash offer", "store credit quote"];
 const RULES_KEYWORDS = ["rules", "ruling", "judge", "priority", "stack", "combat", "mulligan", "commander tax", "layers", "trigger", "legal in"];
-const ORDER_STATUS_KEYWORDS = ["order status", "track order", "tracking", "where is my order", "order code"];
+const ORDER_STATUS_KEYWORDS = [
+	"order status",
+	"track order",
+	"tracking",
+	"where is my order",
+	"where is my package",
+	"package status",
+	"order code",
+	"order id",
+	"order number",
+	"my order",
+	"check my order",
+	"check order",
+	"order update",
+	"order details",
+];
+const ORDER_INTENT_PATTERNS = [
+	/\b(?:where|what|whats|what's|when|how|tell me|check|track|update)\b.*\b(?:order|tracking|shipment|delivery|package|parcel)\b/i,
+	/\b(?:order|tracking|shipment|delivery|package|parcel)\b.*\b(?:status|update|details|progress|placed|date|time)\b/i,
+	/\b(?:order|tracking)\s*(?:id|code|number|no\.?|#)\b/i,
+];
 const EVENT_KEYWORDS = ["event", "fnm", "draft", "prerelease", "commander night", "tournament", "modern night", "standard showdown"];
 const VOUCHER_KEYWORDS = ["voucher", "promo code", "coupon", "discount code", "gift card"];
 const SUPPORT_KEYWORDS = ["support", "issue", "problem", "damaged", "missing", "wrong item", "need help"];
@@ -31,6 +51,13 @@ const FOLLOW_UP_PRODUCT_HINT_PATTERNS = [
 ];
 const PRODUCT_RETRY_PATTERNS = [
 	/^(?:are\s+u\s+sure|are\s+you\s+sure|sure\??|check\s+again|search\s+again|try\s+again|look\s+again|query\s+tool\s+again|pls\s+query|please\s+query|run\s+it\s+again)\b/i,
+];
+const ORDER_RETRY_PATTERNS = [
+	/^(?:are\s+u\s+sure|are\s+you\s+sure|check\s+again|track\s+again|status\s+again|refresh\s+status|retry|try\s+again|look\s+again|query\s+tool\s+again|run\s+it\s+again)\b/i,
+];
+const ORDER_CODE_CAPTURE_PATTERNS = [
+	/\b(?:order(?:\s*(?:code|id|number|no\.?|#))?|tracking(?:\s*(?:code|id|number|no\.?|#))?)\s*(?:is|=|:)?\s*([A-Za-z0-9][A-Za-z0-9\-_/]{3,})\b/i,
+	/\b(?:ref(?:erence)?|confirmation)\s*(?:code|id|number|no\.?|#)?\s*(?:is|=|:)?\s*([A-Za-z0-9][A-Za-z0-9\-_/]{3,})\b/i,
 ];
 
 function initialize({ config, historyManager: sessionHistoryManager, geminiService }) {
@@ -84,13 +111,13 @@ function looksLikeProductLookup(originalText, normalizedText) {
 	return false;
 }
 
-function shouldUseProductLookupFlow(originalText, normalizedText) {
+function shouldUseProductLookupFlow(originalText, normalizedText, history = []) {
 	if (
 		isAcknowledgement(originalText)
 		|| GREETING_KEYWORDS.includes(normalizedText)
 		|| isProductRetryMessage(originalText)
 		|| shouldMergeWithRecentProductContext(originalText)
-		|| includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
+		|| shouldUseOrderLookupFlow(originalText, normalizedText, history)
 		|| includesAny(normalizedText, EVENT_KEYWORDS)
 		|| includesAny(normalizedText, VOUCHER_KEYWORDS)
 		|| includesAny(normalizedText, SUPPORT_KEYWORDS)
@@ -106,7 +133,7 @@ function shouldUseProductLookupFlow(originalText, normalizedText) {
 	return looksLikeProductLookup(originalText, normalizedText) || includesAny(normalizedText, DIRECT_PRODUCT_HINTS);
 }
 
-function detectRoute(originalText, normalizedText) {
+function detectRoute(originalText, normalizedText, history = []) {
 	if (includesAny(normalizedText, UNSUPPORTED_ACTION_KEYWORDS)) {
 		return { type: "unsupported_action" };
 	}
@@ -131,9 +158,12 @@ function detectRoute(originalText, normalizedText) {
 		return { type: "rules" };
 	}
 
+	if (shouldUseOrderLookupFlow(originalText, normalizedText, history)) {
+		return { type: "order_status" };
+	}
+
 	if (
-		includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
-		|| includesAny(normalizedText, EVENT_KEYWORDS)
+		includesAny(normalizedText, EVENT_KEYWORDS)
 		|| includesAny(normalizedText, VOUCHER_KEYWORDS)
 		|| includesAny(normalizedText, SUPPORT_KEYWORDS)
 		|| includesAny(normalizedText, PRODUCT_KEYWORDS)
@@ -197,6 +227,166 @@ function shouldMergeWithRecentProductContext(text) {
 function isProductRetryMessage(text) {
 	const compact = safeTextCleanup(text);
 	return PRODUCT_RETRY_PATTERNS.some((pattern) => pattern.test(compact));
+}
+
+function isOrderRetryMessage(text) {
+	const compact = safeTextCleanup(text);
+	return ORDER_RETRY_PATTERNS.some((pattern) => pattern.test(compact));
+}
+
+function isLikelyOrderCode(value) {
+	const normalized = normalizeOrderCode(value);
+	if (!normalized || normalized.length < 5) {
+		return false;
+	}
+
+	const digitCount = (normalized.match(/\d/g) || []).length;
+	if (digitCount < 5) {
+		return false;
+	}
+
+	if (/^[A-Z]+$/.test(normalized)) {
+		return false;
+	}
+
+	if (/^\d+$/.test(normalized)) {
+		return normalized.length >= 6;
+	}
+
+	return normalized.length >= 6;
+}
+
+function extractOrderCodeCandidates(text = "") {
+	const compact = safeTextCleanup(text);
+	if (!compact) {
+		return [];
+	}
+
+	const foundCodes = [];
+	const seen = new Set();
+	const addCandidate = (candidate) => {
+		const normalized = normalizeOrderCode(candidate);
+		if (!isLikelyOrderCode(normalized)) {
+			return;
+		}
+
+		const key = normalized.toLowerCase();
+		if (seen.has(key)) {
+			return;
+		}
+
+		seen.add(key);
+		foundCodes.push(normalized);
+	};
+
+	for (const pattern of ORDER_CODE_CAPTURE_PATTERNS) {
+		const match = compact.match(pattern);
+		if (match && match[1]) {
+			addCandidate(match[1]);
+		}
+	}
+
+	const genericMatches = compact.match(/\b[A-Za-z0-9][A-Za-z0-9\-_/]{5,}\b/g) || [];
+	for (const genericMatch of genericMatches) {
+		addCandidate(genericMatch);
+	}
+
+	return foundCodes;
+}
+
+function getRecentLikelyOrderMessages(history = [], limit = 4) {
+	return history
+		.filter((entry) => entry?.role === "user" && hasDisplayValue(entry.content))
+		.map((entry) => entry.content)
+		.filter((content) => {
+			const normalized = safeTextCleanup(content).toLowerCase();
+			return includesAny(normalized, ORDER_STATUS_KEYWORDS) || extractOrderCodeCandidates(content).length > 0;
+		})
+		.slice(-limit);
+}
+
+function normalizeOrderLookupPlan(rawPlan = {}, text, history = []) {
+	const shouldRetry = isOrderRetryMessage(text);
+	const normalizedText = safeTextCleanup(text).toLowerCase();
+	const shouldUseRecentOrderContext = shouldRetry || shouldUseOrderLookupFlow(text, normalizedText, history);
+	const explicitCodes = toUniqueNonEmptyStrings([
+		rawPlan.orderCode,
+		rawPlan.order_code,
+		rawPlan.code,
+		rawPlan.reference,
+		rawPlan.orderId,
+		rawPlan.order_id,
+		rawPlan.id,
+		rawPlan.alternativeCodes,
+		rawPlan.alternative_codes,
+		rawPlan.possibleCodes,
+		rawPlan.possible_codes,
+	]).map(normalizeOrderCode).filter(isLikelyOrderCode);
+
+	const extractedCurrentCodes = extractOrderCodeCandidates(text);
+	const recentOrderCodes = getRecentLikelyOrderMessages(history, 4)
+		.flatMap((message) => extractOrderCodeCandidates(message));
+
+	const allCodes = toUniqueNonEmptyStrings([
+		explicitCodes,
+		extractedCurrentCodes,
+		shouldUseRecentOrderContext ? recentOrderCodes : [],
+	]).map(normalizeOrderCode).filter(isLikelyOrderCode);
+
+	return {
+		intent: "order_status_lookup",
+		orderCode: allCodes[0] || "",
+		alternativeCodes: allCodes.slice(1),
+		confidence: safeTextCleanup(rawPlan.confidence || "low").toLowerCase() || "low",
+	};
+}
+
+async function parseOrderLookupPlan(text, history) {
+	const recentUserMessages = getRecentUserMessages(history, 4);
+	try {
+		const parsed = await llmService.generateJson({
+			systemInstruction: [
+				"You extract store order tracking intent from customer chat.",
+				"Return JSON only.",
+				"Do not answer the customer.",
+				"Prefer exact order codes and references.",
+				"If the current message is a retry, reuse order code context from recent user messages.",
+			].join("\n"),
+			history: [],
+			message: [
+				"Return a JSON object with these keys:",
+				'{"intent":"order_status_lookup","orderCode":"","alternativeCodes":[],"confidence":"low|medium|high"}',
+				"",
+				`Recent user messages: ${JSON.stringify(recentUserMessages)}`,
+				`Current user message: ${JSON.stringify(text)}`,
+			].join("\n"),
+		});
+
+		return normalizeOrderLookupPlan(parsed.data, text, history);
+	} catch (_error) {
+		return normalizeOrderLookupPlan({}, text, history);
+	}
+}
+
+function shouldUseOrderLookupFlow(originalText, normalizedText, history = []) {
+	const directOrderIntent = includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
+		|| ORDER_INTENT_PATTERNS.some((pattern) => pattern.test(originalText));
+	const hasOrderCode = extractOrderCodeCandidates(originalText).length > 0;
+	const retry = isOrderRetryMessage(originalText);
+	const recentOrderContext = getRecentLikelyOrderMessages(history, 3).length > 0;
+	const hasOrderReference = /\b(order|tracking|shipment|delivery|package|parcel)\b/i.test(originalText);
+
+	if (directOrderIntent || retry) {
+		return true;
+	}
+
+	if (hasOrderReference && recentOrderContext) {
+		return true;
+	}
+
+	const compact = safeTextCleanup(originalText);
+	const tokenCount = compact ? compact.split(/\s+/).filter(Boolean).length : 0;
+	return hasOrderCode && (hasOrderReference || tokenCount <= 3 || recentOrderContext);
 }
 
 function getRecentLikelyProductMessages(history = [], limit = 4) {
@@ -535,28 +725,227 @@ function formatEventDetailsReply(execution) {
 	return body ? `Event details:\n\n${body}` : "Event details are available, but the response did not include displayable fields.";
 }
 
-function formatOrderStatusReply(execution) {
+const ORDER_EXTRA_DETAIL_FIELDS = [
+	{ key: "tracking_no", label: "Tracking number", keywords: ["tracking", "tracking number"] },
+	{ key: "payment_status", label: "Payment status", keywords: ["payment status"] },
+	{ key: "payment_method", label: "Payment method", keywords: ["payment method", "how paid"] },
+	{ key: "fulfillment_status", label: "Fulfillment status", keywords: ["fulfillment", "fulfilment"] },
+	{ key: "customer_phone", label: "Customer phone", keywords: ["phone", "mobile", "contact number"] },
+	{ key: "shipping_address", label: "Shipping address", keywords: ["shipping address", "delivery address", "address"] },
+	{ key: "billing_address", label: "Billing address", keywords: ["billing address"] },
+	{ key: "carrier", label: "Carrier", keywords: ["carrier", "courier"] },
+	{ key: "created_at", label: "Order date", keywords: ["order date", "placed", "created"] },
+	{ key: "updated_at", label: "Last updated", keywords: ["updated", "last update", "last updated"] },
+	{ key: "notes", label: "Notes", keywords: ["note", "notes", "remark", "remarks"] },
+];
+
+function formatAmountValue(value) {
+	if (!hasDisplayValue(value)) {
+		return "";
+	}
+
+	const numeric = Number(String(value).replace(/,/g, "").replace(/[^\d.-]/g, ""));
+	return Number.isFinite(numeric) ? `$${numeric.toFixed(2)}` : String(value).trim();
+}
+
+function parseEmbeddedJson(value) {
+	if (value === undefined || value === null) {
+		return value;
+	}
+
+	if (typeof value !== "string") {
+		return value;
+	}
+
+	const trimmed = value.trim();
+	if (!trimmed) {
+		return "";
+	}
+
+	if (!((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]")))) {
+		return value;
+	}
+
+	try {
+		return JSON.parse(trimmed);
+	} catch (_error) {
+		return value;
+	}
+}
+
+function formatCartItems(items = []) {
+	if (!Array.isArray(items) || !items.length) {
+		return "Not available";
+	}
+
+	const visibleItems = items.slice(0, 10);
+	return visibleItems.map((item, index) => {
+		const productDetailsRaw = parseEmbeddedJson(
+			item?.product_details
+			?? item?.productDetails
+			?? item?.product_detail
+			?? item?.productDetail
+			?? "",
+		);
+		const productDetails = productDetailsRaw && typeof productDetailsRaw === "object"
+			? productDetailsRaw
+			: {};
+
+			const name = safeTextCleanup(
+				productDetails?.title
+				|| productDetails?.name
+				|| productDetails?.product_title
+				|| productDetails?.product_name
+				|| productDetails?.card_name
+				|| item?.name
+				|| item?.title
+				|| item?.product_name
+				|| item?.product_title
+				|| item?.card_name
+			|| "",
+		) || "Item";
+		const quantity = item?.quantity ?? item?.qty ?? "";
+		const originalPrice = (
+			item?.original_price
+			?? item?.originalPrice
+			?? item?.original_unit_price
+			?? item?.unit_price
+			?? item?.price
+			?? ""
+		);
+		const lineTotal = item?.line_total ?? item?.final_total ?? item?.total ?? item?.price ?? "";
+
+		const base = hasDisplayValue(originalPrice)
+			? `${formatAmountValue(originalPrice)} - ${name}`
+			: name;
+		const parts = [base];
+		if (hasDisplayValue(quantity)) {
+			parts.push(`Qty ${String(quantity).trim()}`);
+		}
+		if (hasDisplayValue(lineTotal)) {
+			parts.push(`Total ${formatAmountValue(lineTotal)}`);
+		}
+
+		return `${index + 1}. ${parts.join(" | ")}`;
+	}).join("\n");
+}
+
+function readOrderField(order = {}, key = "") {
+	switch (key) {
+	case "tracking_no":
+		return safeTextCleanup(order.tracking_no || order.tracking_number || order.trackingNumber || "");
+	case "payment_status":
+		return safeTextCleanup(order.payment_status || "");
+	case "payment_method":
+		return safeTextCleanup(order.payment_method || "");
+	case "fulfillment_status":
+		return safeTextCleanup(order.fulfillment_status || "");
+	case "customer_phone":
+		return safeTextCleanup(order.customer_phone || order.phone || "");
+	case "shipping_address":
+		return safeTextCleanup(order.shipping_address || "");
+	case "billing_address":
+		return safeTextCleanup(order.billing_address || "");
+	case "carrier":
+		return safeTextCleanup(order.carrier || "");
+	case "created_at":
+		return safeTextCleanup(order.created_at || "");
+	case "updated_at":
+		return safeTextCleanup(order.updated_at || order.last_updated || "");
+	case "notes":
+		return safeTextCleanup(order.notes || "");
+	default:
+		return "";
+	}
+}
+
+function extractOrderExtraRequests(userText = "") {
+	const normalized = safeTextCleanup(userText).toLowerCase();
+	if (!normalized) {
+		return { requested: [], broadRequest: false };
+	}
+
+	const requested = ORDER_EXTRA_DETAIL_FIELDS.filter((field) =>
+		field.keywords.some((keyword) => normalized.includes(keyword)),
+	);
+
+	const broadRequest = (
+		/\b(?:more|other|additional|full|all)\b.*\b(?:detail|details|info|information)\b/i.test(normalized)
+		|| /\b(?:show|tell|give)\b.*\b(?:all|everything|full)\b.*\border\b/i.test(normalized)
+	);
+
+	return { requested, broadRequest };
+}
+
+function formatOrderStatusReply(execution, userText = "") {
 	const result = execution?.result || {};
+	const requestedCode = safeTextCleanup(result.orderCodeRequested || execution?.args?.orderCode || "");
+
 	if (!result.success) {
+		if (/order code is required/i.test(String(result.error || ""))) {
+			return "Please share your order code so I can check the order status.";
+		}
+
+		if (isOrderNotFoundError(result.error)) {
+			return requestedCode
+				? `I could not find an order with code "${requestedCode}". Please check the code and resend it exactly as shown in your order confirmation.`
+				: "I could not find that order. Please check the order code and resend it exactly as shown in your order confirmation.";
+		}
+
 		return hasDisplayValue(result.error)
 			? `I could not retrieve the order status. ${result.error}`
 			: "I could not retrieve the order status.";
 	}
 
 	const order = result.order || result.raw?.order || result.raw?.data || result.raw;
-	const body = formatGenericRecord(order, [
-		"orderCode",
-		"code",
-		"id",
-		"status",
-		"payment_status",
-		"fulfillment_status",
-		"tracking_number",
-		"trackingNumber",
-		"carrier",
-		"total",
-	]);
-	return body ? `Order status:\n\n${body}` : "The order was found, but the response did not include displayable fields.";
+	const resolvedOrderCode = safeTextCleanup(order?.code || order?.orderCode || order?.order_code || requestedCode);
+	const status = safeTextCleanup(order?.status || order?.order_status || "");
+	const subtotal = order?.subtotal ?? order?.sub_total ?? order?.original_total ?? "";
+	const discountAmount = order?.discount_amount ?? order?.discount_total ?? order?.discount ?? "";
+	const finalTotal = order?.final_total ?? order?.total ?? "";
+	const customerName = safeTextCleanup(order?.customer_name || order?.customerName || "");
+	const customerEmail = safeTextCleanup(order?.customer_email || order?.customerEmail || "");
+	const cartItems = Array.isArray(order?.cart_items) ? order.cart_items : [];
+
+	const lines = [];
+	pushDisplayLine(lines, "Code", resolvedOrderCode);
+	pushDisplayLine(lines, "Status", status);
+	pushDisplayLine(lines, "Subtotal", subtotal, formatAmountValue);
+	lines.push(`Discount: ${hasDisplayValue(discountAmount) ? formatAmountValue(discountAmount) : "Not available"}`);
+	pushDisplayLine(lines, "Final total", finalTotal, formatAmountValue);
+	pushDisplayLine(lines, "Customer name", customerName);
+	pushDisplayLine(lines, "Customer email", customerEmail);
+	lines.push(`Cart items:\n${formatCartItems(cartItems)}`);
+
+	const { requested, broadRequest } = extractOrderExtraRequests(userText);
+	const extraFieldsToCheck = broadRequest ? ORDER_EXTRA_DETAIL_FIELDS : requested;
+	const extraLines = [];
+	let missingExtraField = false;
+
+	for (const field of extraFieldsToCheck) {
+		const value = readOrderField(order, field.key);
+		if (hasDisplayValue(value)) {
+			extraLines.push(`${field.label}: ${value}`);
+		} else {
+			missingExtraField = true;
+		}
+	}
+
+	if (extraLines.length) {
+		lines.push(`Additional details:\n${extraLines.join("\n")}`);
+	}
+
+	if ((requested.length > 0 || broadRequest) && missingExtraField) {
+		lines.push("This is all the info that I am able to show. If you need further details, please contact the team.");
+	}
+
+	const header = resolvedOrderCode ? `Order details for "${resolvedOrderCode}":` : "Order details:";
+	return `${header}\n\n${lines.join("\n")}`;
+}
+
+function isOrderNotFoundError(errorMessage) {
+	const message = String(errorMessage || "");
+	return /\b404\b/.test(message) || /\bnot found\b/i.test(message) || /\bno query results\b/i.test(message);
 }
 
 function formatVoucherReply(execution) {
@@ -600,10 +989,10 @@ function formatStoreToolReply(toolReply, fallbackText) {
 	switch (preferredExecution?.name) {
 	case "searchProducts":
 		return formatProductSearchReply(preferredExecution, fallbackText);
-	case "getProductDetails":
-		return formatProductDetailsReply(preferredExecution, fallbackText);
-	case "checkOrderStatus":
-		return formatOrderStatusReply(preferredExecution);
+		case "getProductDetails":
+			return formatProductDetailsReply(preferredExecution, fallbackText);
+		case "checkOrderStatus":
+			return formatOrderStatusReply(preferredExecution, fallbackText);
 	case "getEvents":
 		return formatEventsReply(preferredExecution);
 	case "getEventDetails":
@@ -687,6 +1076,39 @@ async function handleProductLookupRoute(text, history) {
 	}
 
 	return formatStoreToolReply({ toolExecutions: [execution] }, text);
+}
+
+function buildOrderCodePromptReply() {
+	return "Please share your order code so I can check the status. Example format: 0405260001G.";
+}
+
+async function handleOrderStatusRoute(text, history) {
+	const lookupPlan = await parseOrderLookupPlan(text, history);
+	const candidateCodes = toUniqueNonEmptyStrings([
+		lookupPlan.orderCode,
+		lookupPlan.alternativeCodes,
+	]).map(normalizeOrderCode).filter(isLikelyOrderCode).slice(0, 4);
+
+	if (!candidateCodes.length) {
+		return buildOrderCodePromptReply();
+	}
+
+	let fallbackExecution = null;
+	for (const orderCode of candidateCodes) {
+		const result = await storeTools.checkOrderStatus({ orderCode });
+		const execution = {
+			name: "checkOrderStatus",
+			args: { orderCode },
+			result,
+		};
+
+		fallbackExecution = execution;
+		if (result.success || !isOrderNotFoundError(result.error)) {
+			return formatStoreToolReply({ toolExecutions: [execution] }, text);
+		}
+	}
+
+	return formatStoreToolReply({ toolExecutions: [fallbackExecution] }, text);
 }
 
 async function handleRagRoute(text, history, category) {
@@ -783,8 +1205,8 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 	}
 
 	const normalizedText = cleanedText.toLowerCase();
-	const route = detectRoute(cleanedText, normalizedText);
 	const history = getHistory(chatId);
+	const route = detectRoute(cleanedText, normalizedText, history);
 
 	let reply;
 	if (route.type === "greeting") {
@@ -799,6 +1221,8 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 		reply = await handleRagRoute(cleanedText, history, route.category);
 	} else if (route.type === "rules") {
 		reply = await handleRulesRoute(cleanedText);
+	} else if (route.type === "order_status" && runtimeConfig.features.tools.enabled) {
+		reply = await handleOrderStatusRoute(cleanedText, history);
 	} else if (route.type === "store_tools" && runtimeConfig.features.tools.enabled) {
 		const storeContext = {
 			chatId,
@@ -807,7 +1231,7 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 			originalMessage: cleanedText,
 		};
 
-		reply = shouldUseProductLookupFlow(cleanedText, normalizedText)
+		reply = shouldUseProductLookupFlow(cleanedText, normalizedText, history)
 			? await handleProductLookupRoute(cleanedText, history)
 			: await handleStoreToolsRoute(cleanedText, history, storeContext);
 	} else {

@@ -35,12 +35,29 @@ Not supported in chat:
 ```bash
 GEMINI_API_KEY=your-gemini-api-key
 GEMINI_MODEL=gemini-2.5-flash
+GEMINI_AUTH_MODE=auto
+GEMINI_USE_VERTEX_AI=false
+GOOGLE_CLOUD_PROJECT=
+GOOGLE_CLOUD_LOCATION=
+GOOGLE_APPLICATION_CREDENTIALS=
+GEMINI_VERTEX_API_VERSION=
 STORE_API_BASE_URL=
 STORE_API_KEY=
+MOX_API_BASE_URL=
+MOX_API_USERNAME=
+MOX_API_PASSWORD=
+MOX_API_USER_TYPE=Customer
+MOX_API_TIMEOUT=30
 RAG_SOURCE_PATH=./rag
 RULES_GROUNDING_ENABLED=false
 API_PORT=3000
 ```
+
+`MOX_API_TIMEOUT` accepts milliseconds (`30000`, `30000ms`) or seconds (`30`, `30s`).
+
+Gemini authentication modes:
+- API key: set `GEMINI_API_KEY` (default behavior in `GEMINI_AUTH_MODE=auto`).
+- Vertex service account: set `GEMINI_AUTH_MODE=vertex` (or `GEMINI_USE_VERTEX_AI=true`) and configure `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `GOOGLE_APPLICATION_CREDENTIALS`.
 
 ## Run
 

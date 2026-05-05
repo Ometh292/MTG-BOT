@@ -1,6 +1,8 @@
 const { generateTicketId, normalizeOrderCode, safeTextCleanup } = require("../utils/helpers");
 
 let runtimeConfig;
+let moxAccessToken = null;
+let moxLoginPromise = null;
 
 const CARD_TYPE_TOKENS = [
 	"artifact",
@@ -32,6 +34,8 @@ const TRAILING_CHATTER_PATTERNS = [
 
 function initialize(config) {
 	runtimeConfig = config;
+	clearMoxToken();
+	moxLoginPromise = null;
 }
 
 function stripWrappingQuotes(value) {
@@ -170,6 +174,224 @@ function buildSearchCandidates({
 
 async function getFetch() {
 	return (await import("node-fetch")).default;
+}
+
+function getMoxConfig() {
+	const moxApi = runtimeConfig?.moxApi || {};
+	return {
+		baseUrl: String(moxApi.baseUrl || "").trim(),
+		username: String(moxApi.username || "").trim(),
+		password: String(moxApi.password || "").trim(),
+		userType: String(moxApi.userType || "Customer").trim(),
+		timeoutMs: Number(moxApi.timeoutMs || runtimeConfig?.storeApi?.timeoutMs || 10000),
+	};
+}
+
+function hasMoxCredentials() {
+	const config = getMoxConfig();
+	return Boolean(config.baseUrl && config.username && config.password);
+}
+
+function hasMoxBaseUrl() {
+	return Boolean(getMoxConfig().baseUrl);
+}
+
+function getApiErrorMessage(payload, fallback = "") {
+	if (!payload || typeof payload !== "object") {
+		return fallback;
+	}
+
+	if (typeof payload.message === "string" && payload.message.trim()) {
+		return payload.message.trim();
+	}
+
+	return fallback;
+}
+
+function truncateForError(value, maxLength = 280) {
+	const text = String(value || "").replace(/\s+/g, " ").trim();
+	if (!text) {
+		return "";
+	}
+
+	return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function parseApiPayload(text = "") {
+	const trimmed = String(text || "").trim();
+	if (!trimmed) {
+		return {};
+	}
+
+	return JSON.parse(trimmed);
+}
+
+function isAbortError(error) {
+	if (!error) {
+		return false;
+	}
+
+	const name = String(error.name || "").toLowerCase();
+	const message = String(error.message || "").toLowerCase();
+	return name === "aborterror" || message.includes("aborted");
+}
+
+async function requestMoxApi(method, endpoint, options = {}) {
+	const config = getMoxConfig();
+	if (!config.baseUrl) {
+		throw new Error("MOX_API_BASE_URL is not configured");
+	}
+
+	const runRequest = async () => {
+		const token = await getMoxAccessToken();
+		const fetch = await getFetch();
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+
+		try {
+			const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${endpoint}`, {
+				...options,
+				method,
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${token}`,
+					...(options.headers || {}),
+				},
+				signal: controller.signal,
+			});
+
+			if (response.status === 401) {
+				return { unauthorized: true, response };
+			}
+
+			const payloadText = await response.text();
+			if (!response.ok) {
+				let message = "";
+				try {
+					const payload = parseApiPayload(payloadText);
+					message = getApiErrorMessage(payload, "");
+				} catch (_error) {
+					message = truncateForError(payloadText);
+				}
+
+				throw new Error(`Mox API ${response.status}: ${message || "Request failed"}`);
+			}
+
+			let payload = {};
+			if (response.status !== 204) {
+				try {
+					payload = parseApiPayload(payloadText);
+				} catch (_error) {
+					const contentType = response.headers.get("content-type") || "unknown";
+					throw new Error(`Mox API returned non-JSON response (${contentType}) for ${endpoint}`);
+				}
+			}
+
+			return {
+				unauthorized: false,
+				response,
+				payload,
+			};
+		} catch (error) {
+			if (isAbortError(error)) {
+				throw new Error(`Mox API request timed out after ${config.timeoutMs}ms (${method} ${endpoint}).`);
+			}
+
+			throw error;
+		} finally {
+			clearTimeout(timeout);
+		}
+	};
+
+	let result = await runRequest();
+	if (result.unauthorized) {
+		clearMoxToken();
+		result = await runRequest();
+		if (result.unauthorized) {
+			const errorText = await result.response.text();
+			throw new Error(`Mox API 401: ${errorText}`);
+		}
+	}
+
+	return result.payload;
+}
+
+async function getMoxAccessToken() {
+	if (moxAccessToken) {
+		return moxAccessToken;
+	}
+
+	if (!moxLoginPromise) {
+		moxLoginPromise = loginToMoxApi().finally(() => {
+			moxLoginPromise = null;
+		});
+	}
+
+	moxAccessToken = await moxLoginPromise;
+	return moxAccessToken;
+}
+
+async function loginToMoxApi() {
+	const config = getMoxConfig();
+	if (!config.baseUrl || !config.username || !config.password) {
+		throw new Error("MOX API credentials are not fully configured");
+	}
+
+	const fetch = await getFetch();
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+
+	try {
+		const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/login`, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				username: config.username,
+				password: config.password,
+				type: config.userType || "Customer",
+				remember: true,
+			}),
+			signal: controller.signal,
+		});
+
+		const payloadText = await response.text();
+		let payload = {};
+		if (payloadText) {
+			try {
+				payload = JSON.parse(payloadText);
+			} catch (_error) {
+				payload = {};
+			}
+		}
+
+		if (!response.ok) {
+			const message = getApiErrorMessage(payload, payloadText);
+			throw new Error(`Mox login failed (${response.status}): ${message}`);
+		}
+
+			const token = safeTextCleanup(payload.token);
+			if (!token) {
+				throw new Error("Mox login response did not include a token");
+			}
+
+			return token;
+	} catch (error) {
+		if (isAbortError(error)) {
+			throw new Error(`Mox login timed out after ${config.timeoutMs}ms.`);
+		}
+
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function clearMoxToken() {
+	moxAccessToken = null;
 }
 
 async function requestStoreApi(endpoint, options = {}) {
@@ -589,21 +811,817 @@ async function getProductDetails({
 	}
 }
 
-async function checkOrderStatus({ orderCode }) {
-	const normalizedOrderCode = normalizeOrderCode(orderCode);
+function resolveOrderCodeInput(args = {}) {
+	const candidates = [
+		args.orderCode,
+		args.order_code,
+		args.code,
+		args.reference,
+		args.orderId,
+		args.order_id,
+		args.id,
+	];
+
+	for (const candidate of candidates) {
+		const normalized = normalizeOrderCode(candidate);
+		if (normalized) {
+			return normalized;
+		}
+	}
+
+	return "";
+}
+
+function normalizeOrdersList(apiResult) {
+	if (Array.isArray(apiResult)) {
+		return apiResult;
+	}
+
+	if (Array.isArray(apiResult?.data)) {
+		return apiResult.data;
+	}
+
+	if (Array.isArray(apiResult?.orders)) {
+		return apiResult.orders;
+	}
+
+	if (Array.isArray(apiResult?.items)) {
+		return apiResult.items;
+	}
+
+	return [];
+}
+
+function resolveOrderCodeFromRecord(order = {}) {
+	return normalizeOrderCode(
+		order.code
+		|| order.orderCode
+		|| order.order_code
+		|| order.reference
+		|| order.order_reference,
+	);
+}
+
+function pickBestOrderRecord(orders = [], normalizedOrderCode = "") {
+	if (!orders.length) {
+		return null;
+	}
+
+	const normalizedRequested = normalizeOrderCode(normalizedOrderCode);
+	if (!normalizedRequested) {
+		return orders[0];
+	}
+
+	const exactMatch = orders.find((order) => resolveOrderCodeFromRecord(order) === normalizedRequested);
+	if (exactMatch) {
+		return exactMatch;
+	}
+
+	return orders[0];
+}
+
+function hasDisplayValue(value) {
+	return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function resolveFirstRawValue(values = []) {
+	for (const value of values) {
+		if (value === undefined || value === null) {
+			continue;
+		}
+
+		if (typeof value === "object") {
+			continue;
+		}
+
+		if (typeof value === "number") {
+			if (!Number.isNaN(value)) {
+				return value;
+			}
+			continue;
+		}
+
+		if (hasDisplayValue(value)) {
+			return value;
+		}
+	}
+
+	return "";
+}
+
+function resolveFirstAnyValue(values = []) {
+	for (const value of values) {
+		if (value === undefined || value === null) {
+			continue;
+		}
+
+		if (typeof value === "number") {
+			if (!Number.isNaN(value)) {
+				return value;
+			}
+			continue;
+		}
+
+		if (typeof value === "object") {
+			return value;
+		}
+
+		if (hasDisplayValue(value)) {
+			return value;
+		}
+	}
+
+	return "";
+}
+
+function resolveFirstDisplayValue(values = []) {
+	const value = resolveFirstRawValue(values);
+	return hasDisplayValue(value) ? safeTextCleanup(value) : "";
+}
+
+function parsePossiblyJson(value) {
+	if (value === undefined || value === null) {
+		return value;
+	}
+
+	if (typeof value !== "string") {
+		return value;
+	}
+
+	const trimmed = value.trim();
+	if (!trimmed) {
+		return "";
+	}
+
+	if (!((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]")))) {
+		return value;
+	}
 
 	try {
-		const apiResult = await requestStoreApi(`/api/orders/${encodeURIComponent(normalizedOrderCode)}`);
+		return JSON.parse(trimmed);
+	} catch (_error) {
+		return value;
+	}
+}
+
+function normalizeOrderDetailsPayload(payload) {
+	const parsedPayload = parsePossiblyJson(payload);
+	if (!parsedPayload || typeof parsedPayload !== "object") {
+		return {};
+	}
+
+	if (parsedPayload.data && typeof parsedPayload.data === "object") {
+		return parsedPayload.data;
+	}
+
+	return parsedPayload;
+}
+
+function normalizeMetaData(metaDataValue) {
+	const parsed = parsePossiblyJson(metaDataValue);
+	return parsed && typeof parsed === "object" ? parsed : {};
+}
+
+function toNumberValue(value) {
+	if (typeof value === "number") {
+		return Number.isFinite(value) ? value : null;
+	}
+
+	if (!hasDisplayValue(value)) {
+		return null;
+	}
+
+	const sanitized = String(value).replace(/,/g, "").replace(/[^\d.-]/g, "");
+	if (!sanitized) {
+		return null;
+	}
+
+	const numeric = Number(sanitized);
+	return Number.isFinite(numeric) ? numeric : null;
+}
+
+function normalizeAddress(value) {
+	if (!value) {
+		return "";
+	}
+
+	if (typeof value === "string") {
+		return safeTextCleanup(value);
+	}
+
+	if (typeof value !== "object") {
+		return "";
+	}
+
+	const parts = [
+		value.name,
+		value.address_line_1,
+		value.address_line_2,
+		value.city,
+		value.state,
+		value.postal_code || value.zip,
+		value.country,
+	].map((part) => safeTextCleanup(part)).filter(Boolean);
+
+	return parts.join(", ");
+}
+
+function extractArrayFromObject(value) {
+	if (!value || typeof value !== "object") {
+		return [];
+	}
+
+	const arrayKeys = [
+		"cart_items",
+		"cartItems",
+		"items",
+		"order_items",
+		"orderItems",
+		"products",
+		"order_products",
+		"orderProducts",
+		"cards",
+	];
+
+	for (const key of arrayKeys) {
+		if (Array.isArray(value[key])) {
+			return value[key];
+		}
+	}
+
+	return [];
+}
+
+function resolveCartItemsSource(sources = []) {
+	for (const source of sources) {
+		const parsed = parsePossiblyJson(source);
+		if (Array.isArray(parsed)) {
+			return parsed;
+		}
+
+		const fromObject = extractArrayFromObject(parsed);
+		if (fromObject.length) {
+			return fromObject;
+		}
+	}
+
+	return [];
+}
+
+function getCartLineTotals(item = {}) {
+	const quantityRaw = resolveFirstRawValue([
+		item.quantity,
+		item.qty,
+		item.count,
+		item.units,
+		item?.pivot?.quantity,
+	]);
+
+	const quantity = toNumberValue(quantityRaw);
+	const originalUnitPriceRaw = resolveFirstRawValue([
+		item.original_price,
+		item.originalPrice,
+		item.original_unit_price,
+		item.originalUnitPrice,
+		item.unit_price,
+		item.unitPrice,
+		item.regular_price,
+		item.base_price,
+		item.price,
+	]);
+
+	const finalUnitPriceRaw = resolveFirstRawValue([
+		item.final_price,
+		item.finalPrice,
+		item.discounted_price,
+		item.discountedPrice,
+		item.sale_price,
+		item.selling_price,
+	]);
+
+	const lineTotalRaw = resolveFirstRawValue([
+		item.line_total,
+		item.lineTotal,
+		item.final_total,
+		item.total,
+		item.subtotal,
+		item.price_total,
+		item.pivot?.total,
+		item.pivot?.subtotal,
+	]);
+
+	const discountRaw = resolveFirstRawValue([
+		item.discount_amount,
+		item.discount_total,
+		item.discount,
+		item.total_discount,
+	]);
+
+	const originalUnitPrice = toNumberValue(originalUnitPriceRaw);
+	const finalUnitPrice = toNumberValue(finalUnitPriceRaw);
+	const lineTotal = toNumberValue(lineTotalRaw);
+	const discountAmount = toNumberValue(discountRaw);
+	const normalizedQuantity = quantity && quantity > 0 ? quantity : null;
+
+	const lineOriginalTotal = (
+		normalizedQuantity !== null && originalUnitPrice !== null
+			? originalUnitPrice * normalizedQuantity
+			: null
+	);
+
+	return {
+		quantityRaw,
+		originalUnitPriceRaw,
+		finalUnitPriceRaw,
+		lineTotalRaw,
+		discountRaw,
+		quantity: normalizedQuantity,
+		originalUnitPrice,
+		finalUnitPrice,
+		lineTotal,
+		discountAmount,
+		lineOriginalTotal,
+	};
+}
+
+function normalizeCartItems(...sources) {
+	const rawItems = resolveCartItemsSource(sources);
+	if (!rawItems.length) {
+		return [];
+	}
+
+	return rawItems
+		.map((item = {}) => {
+			const productDetailsRaw = parsePossiblyJson(
+				item.product_details
+				?? item.productDetails
+				?? item.product_detail
+				?? item.productDetail
+				?? "",
+			);
+			const productDetails = productDetailsRaw && typeof productDetailsRaw === "object"
+				? productDetailsRaw
+				: {};
+			const productRaw = parsePossiblyJson(item.product);
+			const product = productRaw && typeof productRaw === "object" ? productRaw : {};
+
+			const name = resolveFirstDisplayValue([
+				productDetails.title,
+				productDetails.name,
+				productDetails.product_title,
+				productDetails.product_name,
+				productDetails.card_name,
+				item.title,
+				item.name,
+				item.product_name,
+				item.product_title,
+				item.card_name,
+				item.variant_name,
+				item.sku_name,
+				product.title,
+				product.name,
+			]);
+
+			const totals = getCartLineTotals(item);
+
+			return {
+				name,
+				title: name,
+				quantity: hasDisplayValue(totals.quantityRaw) ? totals.quantityRaw : "",
+				original_price: hasDisplayValue(totals.originalUnitPriceRaw) ? totals.originalUnitPriceRaw : "",
+				final_price: hasDisplayValue(totals.finalUnitPriceRaw) ? totals.finalUnitPriceRaw : "",
+				line_total: hasDisplayValue(totals.lineTotalRaw) ? totals.lineTotalRaw : "",
+				discount_amount: hasDisplayValue(totals.discountRaw) ? totals.discountRaw : "",
+				_computed: totals,
+			};
+		})
+		.filter((item) => hasDisplayValue(item.name) || hasDisplayValue(item.quantity) || hasDisplayValue(item.line_total));
+}
+
+function computeCartFinancials(cartItems = []) {
+	let subtotalFromOriginal = 0;
+	let hasSubtotalFromOriginal = false;
+	let discountFromLines = 0;
+	let hasDiscountFromLines = false;
+
+	for (const item of cartItems) {
+		const computed = item?._computed;
+		if (!computed) {
+			continue;
+		}
+
+		if (computed.lineOriginalTotal !== null) {
+			subtotalFromOriginal += computed.lineOriginalTotal;
+			hasSubtotalFromOriginal = true;
+		}
+
+		if (computed.discountAmount !== null) {
+			discountFromLines += computed.discountAmount;
+			hasDiscountFromLines = true;
+		}
+	}
+
+	return {
+		subtotalFromOriginal: hasSubtotalFromOriginal ? subtotalFromOriginal : null,
+		discountFromLines: hasDiscountFromLines ? discountFromLines : null,
+	};
+}
+
+function stripInternalCartFields(cartItems = []) {
+	return cartItems.map((item) => {
+		const { _computed, ...cleanItem } = item || {};
+		return cleanItem;
+	});
+}
+
+function buildOrderStatusSummary(order = {}, detailsPayload = null, statusPayload = null) {
+	const metaData = normalizeMetaData(order?.meta_data);
+	const detailsData = normalizeOrderDetailsPayload(detailsPayload);
+	const detailsOrder = detailsData?.order && typeof detailsData.order === "object" ? detailsData.order : detailsData;
+	const statusData = statusPayload && typeof statusPayload === "object"
+		? normalizeOrderDetailsPayload(statusPayload)
+		: {};
+	const customerData = detailsData?.customer && typeof detailsData.customer === "object"
+		? detailsData.customer
+		: (detailsOrder?.customer && typeof detailsOrder.customer === "object" ? detailsOrder.customer : {});
+	const paymentDetails = detailsOrder?.payment_details && typeof detailsOrder.payment_details === "object"
+		? detailsOrder.payment_details
+		: {};
+
+	const orderCode = resolveFirstDisplayValue([
+		detailsOrder.order_code,
+		detailsOrder.orderCode,
+		detailsOrder.code,
+		statusData.order_code,
+		statusData.orderCode,
+		order.code,
+		order.order_code,
+		order.orderCode,
+	]);
+
+	const status = resolveFirstDisplayValue([
+		detailsOrder.order_status,
+		detailsOrder.status,
+		statusData.order_status,
+		statusData.status,
+		order.order_status,
+		order.status,
+		order.fulfillment_status,
+	]);
+
+	const trackingNo = resolveFirstDisplayValue([
+		detailsOrder.tracking_no,
+		detailsOrder.tracking_number,
+		detailsOrder.trackingNumber,
+		statusData.tracking_no,
+		statusData.tracking_number,
+		statusData.trackingNumber,
+		order.tracking_no,
+		order.tracking_number,
+		order.trackingNumber,
+	]);
+
+	const customerName = resolveFirstDisplayValue([
+		customerData.name,
+		customerData.full_name,
+		customerData.customer_name,
+		detailsOrder.customer_name,
+		detailsData.customer_name,
+		order.customer_name,
+		order.customerName,
+	]);
+
+	const customerEmail = resolveFirstDisplayValue([
+		customerData.email,
+		detailsOrder.customer_email,
+		detailsData.customer_email,
+		order.customer_email,
+		order.customerEmail,
+	]);
+
+	const cartItemsWithComputations = normalizeCartItems(
+		detailsData.cart_items,
+		detailsData.cartItems,
+		detailsData.items,
+		detailsData.order_items,
+		detailsData.orderItems,
+		detailsData.products,
+		detailsData.order_products,
+		detailsData.cards,
+		detailsOrder.cart_items,
+		detailsOrder.cartItems,
+		detailsOrder.items,
+		detailsOrder.order_items,
+		detailsOrder.orderItems,
+		detailsOrder.products,
+		detailsOrder.order_products,
+		detailsOrder.cards,
+		order.cart_items,
+		order.cartItems,
+		order.items,
+		order.order_items,
+		order.orderItems,
+		order.products,
+		order.order_products,
+		order.cards,
+		metaData.cart_items,
+		metaData.cartItems,
+		metaData.items,
+		metaData.order_items,
+		metaData.orderItems,
+		metaData.products,
+		metaData.order_products,
+		metaData.cards,
+	);
+	const cartFinancials = computeCartFinancials(cartItemsWithComputations);
+
+	const finalTotalRaw = resolveFirstRawValue([
+		detailsOrder.final_total,
+		detailsOrder.total,
+		detailsOrder.grand_total,
+		detailsData.final_total,
+		detailsData.total,
+		detailsData.grand_total,
+		order.final_total,
+		order.total,
+		order.grand_total,
+		metaData.final_total,
+		metaData.total,
+	]);
+	const subtotalRaw = resolveFirstRawValue([
+		detailsOrder.sub_total,
+		detailsOrder.subtotal,
+		detailsOrder.original_total,
+		detailsOrder.cart_total,
+		detailsData.sub_total,
+		detailsData.subtotal,
+		detailsData.original_total,
+		detailsData.cart_total,
+		order.sub_total,
+		order.subtotal,
+		order.original_total,
+		order.cart_total,
+		metaData.sub_total,
+		metaData.subtotal,
+		metaData.original_total,
+		metaData.cart_total,
+	]);
+	const discountRaw = resolveFirstRawValue([
+		detailsOrder.discount_amount,
+		detailsOrder.discount_total,
+		detailsOrder.total_discount,
+		detailsOrder.discount,
+		detailsData.discount_amount,
+		detailsData.discount_total,
+		detailsData.total_discount,
+		detailsData.discount,
+		order.discount_amount,
+		order.discount_total,
+		order.total_discount,
+		order.discount,
+		metaData.discount_amount,
+		metaData.discount_total,
+		metaData.total_discount,
+		metaData.discount,
+	]);
+
+	const finalTotalNumber = toNumberValue(finalTotalRaw);
+	const subtotalNumberFromApi = toNumberValue(subtotalRaw);
+
+	const subtotalComputed = subtotalNumberFromApi !== null
+		? subtotalRaw
+		: (cartFinancials.subtotalFromOriginal !== null ? cartFinancials.subtotalFromOriginal : "");
+
+	let discountComputed = discountRaw;
+	if (!hasDisplayValue(discountComputed) && cartFinancials.discountFromLines !== null) {
+		discountComputed = cartFinancials.discountFromLines;
+	}
+	if (!hasDisplayValue(discountComputed) && subtotalNumberFromApi !== null && finalTotalNumber !== null) {
+		const diff = subtotalNumberFromApi - finalTotalNumber;
+		discountComputed = diff > 0 ? diff : 0;
+	}
+	if (!hasDisplayValue(discountComputed) && subtotalNumberFromApi === null && finalTotalNumber !== null && cartFinancials.subtotalFromOriginal !== null) {
+		const diff = cartFinancials.subtotalFromOriginal - finalTotalNumber;
+		discountComputed = diff > 0 ? diff : 0;
+	}
+
+	return {
+		id: resolveFirstRawValue([detailsOrder.id, order.id, statusData.order_id]),
+		orderCode,
+		code: orderCode,
+		status,
+		order_status: status,
+		subtotal: subtotalComputed,
+		discount_amount: discountComputed,
+		discount: discountComputed,
+		final_total: finalTotalRaw,
+		total: finalTotalRaw,
+		customer_name: customerName,
+		customer_email: customerEmail,
+		cart_items: stripInternalCartFields(cartItemsWithComputations),
+		payment_status: resolveFirstDisplayValue([
+			detailsOrder.payment_status,
+			statusData.payment_status,
+			order.payment_status,
+		]),
+		fulfillment_status: resolveFirstDisplayValue([
+			detailsOrder.fulfillment_status,
+			statusData.fulfillment_status,
+			order.fulfillment_status,
+		]),
+		tracking_no: trackingNo,
+		created_at: resolveFirstDisplayValue([
+			detailsOrder.created_at,
+			detailsData.created_at,
+			order.created_at,
+		]),
+		updated_at: resolveFirstDisplayValue([
+			detailsOrder.updated_at,
+			detailsData.updated_at,
+			statusData.last_updated,
+			order.updated_at,
+		]),
+		last_updated: resolveFirstDisplayValue([
+			statusData.last_updated,
+			detailsOrder.updated_at,
+			order.updated_at,
+		]),
+		payment_method: resolveFirstDisplayValue([
+			detailsOrder.payment_method,
+			paymentDetails.payment_method,
+			order.payment_method,
+		]),
+		customer_phone: resolveFirstDisplayValue([
+			customerData.phone,
+			customerData.mobile,
+			detailsOrder.customer_phone,
+			detailsData.customer_phone,
+		]),
+		shipping_address: normalizeAddress(resolveFirstAnyValue([
+			detailsData.shipping_address,
+			detailsOrder.shipping_address,
+		])),
+		billing_address: normalizeAddress(resolveFirstAnyValue([
+			detailsData.billing_address,
+			detailsOrder.billing_address,
+		])),
+		carrier: resolveFirstDisplayValue([
+			detailsOrder.carrier,
+			statusData.carrier,
+			order.carrier,
+		]),
+		notes: resolveFirstDisplayValue([
+			detailsOrder.notes,
+			detailsData.notes,
+			order.notes,
+		]),
+	};
+}
+
+function extractStatusFromDetailsPayload(detailsPayload = null) {
+	const detailsData = normalizeOrderDetailsPayload(detailsPayload);
+	const detailsOrder = detailsData?.order && typeof detailsData.order === "object" ? detailsData.order : detailsData;
+	return resolveFirstDisplayValue([
+		detailsOrder.order_status,
+		detailsOrder.status,
+		detailsData.order_status,
+		detailsData.status,
+	]);
+}
+
+function isNotFoundErrorMessage(errorMessage) {
+	const message = String(errorMessage || "");
+	return /\b404\b/.test(message) || /\bnot found\b/i.test(message) || /\bno query results\b/i.test(message);
+}
+
+async function fetchMoxOrderRecordByCode(normalizedOrderCode) {
+	const searchPayload = await requestMoxApi("GET", `/orders?search=${encodeURIComponent(normalizedOrderCode)}`);
+	const orders = normalizeOrdersList(searchPayload);
+	const matchedOrder = pickBestOrderRecord(orders, normalizedOrderCode);
+
+	return {
+		searchPayload,
+		matchedOrder,
+		orders,
+	};
+}
+
+async function fetchMoxOrderDetailsById(orderId) {
+	if (!orderId) {
+		return null;
+	}
+
+	try {
+		const payload = await requestMoxApi("GET", `/fetch-order-details/${encodeURIComponent(orderId)}`);
+		const statusCode = Number(payload?.status);
+		if (statusCode === 404 || /order not found/i.test(String(payload?.message || ""))) {
+			return null;
+		}
+		return payload;
+	} catch (error) {
+		if (isNotFoundErrorMessage(error.message)) {
+			return null;
+		}
+
+		// Non-critical route: keep the main order search result instead of failing the whole request.
+		return null;
+	}
+}
+
+async function fetchMoxOrderStatusById(orderId) {
+	if (!orderId) {
+		return null;
+	}
+
+	try {
+		const payload = await requestMoxApi("GET", `/fetch-order-status/${encodeURIComponent(orderId)}`);
+		const statusCode = Number(payload?.status);
+		if (statusCode === 404 || /order not found/i.test(String(payload?.message || ""))) {
+			return null;
+		}
+		return payload;
+	} catch (error) {
+		if (isNotFoundErrorMessage(error.message)) {
+			return null;
+		}
+
+		// Non-critical route: keep the main order search result instead of failing the whole request.
+		return null;
+	}
+}
+
+async function checkOrderStatus(args = {}) {
+	const normalizedOrderCode = resolveOrderCodeInput(args);
+	if (!normalizedOrderCode) {
+		return {
+			success: false,
+			source: "store_api",
+			error: "Order code is required.",
+		};
+	}
+
+	try {
+		if (hasMoxBaseUrl() && !hasMoxCredentials()) {
+			return {
+				success: false,
+				source: "mox_api",
+				orderCodeRequested: normalizedOrderCode,
+				error: "MOX API credentials are incomplete. Configure MOX_API_USERNAME and MOX_API_PASSWORD.",
+			};
+		}
+
+		const useMoxApi = hasMoxCredentials();
+		const apiResult = useMoxApi
+			? await (async () => {
+				const { searchPayload, matchedOrder } = await fetchMoxOrderRecordByCode(normalizedOrderCode);
+				if (!matchedOrder) {
+					return {
+						notFound: true,
+						raw: searchPayload,
+					};
+				}
+
+				const orderDetailsPayload = await fetchMoxOrderDetailsById(matchedOrder.id);
+				const statusFromDetails = extractStatusFromDetailsPayload(orderDetailsPayload);
+				const hasStatusFromDetails = hasDisplayValue(statusFromDetails);
+				const orderStatusPayload = hasStatusFromDetails ? null : await fetchMoxOrderStatusById(matchedOrder.id);
+
+				return {
+					notFound: false,
+					order: buildOrderStatusSummary(matchedOrder, orderDetailsPayload, orderStatusPayload),
+					raw: {
+						search: searchPayload,
+						details: orderDetailsPayload,
+						status: orderStatusPayload,
+					},
+				};
+			})()
+			: await requestStoreApi(`/api/orders/${encodeURIComponent(normalizedOrderCode)}`);
+
+		if (useMoxApi && apiResult.notFound) {
+			return {
+				success: false,
+				source: "mox_api",
+				orderCodeRequested: normalizedOrderCode,
+				error: `Order not found for code "${normalizedOrderCode}".`,
+				raw: apiResult.raw,
+			};
+		}
+
 		return {
 			success: true,
-			source: "store_api",
-			order: apiResult.order || apiResult.data || apiResult,
-			raw: apiResult,
+			source: useMoxApi ? "mox_api" : "store_api",
+			orderCodeRequested: normalizedOrderCode,
+			order: useMoxApi
+				? apiResult.order
+				: (apiResult.order || apiResult.data || apiResult),
+			raw: useMoxApi ? apiResult.raw : apiResult,
 		};
 	} catch (error) {
 		return {
 			success: false,
-			source: "store_api",
+			source: hasMoxCredentials() ? "mox_api" : "store_api",
+			orderCodeRequested: normalizedOrderCode,
 			error: error.message,
 		};
 	}
@@ -684,7 +1702,7 @@ function getToolDeclarations() {
 		},
 		{
 			name: "checkOrderStatus",
-			description: "Look up the status of an existing store order via /api/orders/{id}.",
+			description: "Look up an existing order by order code or reference and return current order status details.",
 			parametersJsonSchema: {
 				type: "object",
 				properties: {
