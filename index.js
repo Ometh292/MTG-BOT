@@ -64,16 +64,20 @@ async function bootstrap() {
 
 	// Crawl website first to update rag/*.md files, then build the vector index
 	if (config.features.rag.enabled) {
-		// Step 1: Crawl website and refresh Markdown knowledge files
-		console.log("Crawling moxandlotus.sg to refresh knowledge base...\n");
-		try {
-			const crawlResult = await crawlerService.runCrawler();
-			console.log(`Crawl complete: ${crawlResult.savedCount} pages updated.\n`);
-		} catch (crawlError) {
-			console.warn("[Crawler] Website crawl failed (will use existing rag/*.md files):", crawlError.message);
+		if (config.features.rag.crawlOnStartup) {
+			// Step 1: Crawl website and refresh Markdown knowledge files
+			console.log("Crawling moxandlotus.sg to refresh knowledge base...\n");
+			try {
+				const crawlResult = await crawlerService.runCrawler();
+				console.log(`Crawl complete: ${crawlResult.savedCount} pages updated.\n`);
+			} catch (crawlError) {
+				console.warn("[Crawler] Website crawl failed (will use existing rag/*.md files):", crawlError.message);
+			}
+		} else {
+			console.log("Startup crawler is disabled. Using existing rag/*.md files.\n");
 		}
 
-		// Step 2: Build (or rebuild) the vector index from rag/*.md
+		// Step 2: Build (or rebuild) the vector index from existing rag/*.md
 		console.log("Building RAG knowledge index...\n");
 		try {
 			await ragService.buildIndex();
@@ -82,8 +86,10 @@ async function bootstrap() {
 			console.warn("[RAG] Index build failed (bot will start without RAG):", ragError.message);
 		}
 
-		// Step 3: Schedule daily crawl + index rebuild (runs at midnight Colombo time)
-		crawlerService.scheduleDaily(0, 0, ragService);
+		if (config.features.rag.scheduleDailyCrawl) {
+			// Step 3: Schedule daily crawl + index rebuild (runs at midnight Colombo time)
+			crawlerService.scheduleDaily(0, 0, ragService);
+		}
 	}
 
 	const client = whatsappService.initializeClient(config, {

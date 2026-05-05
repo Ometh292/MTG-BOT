@@ -426,7 +426,142 @@ async function requestStoreApi(endpoint, options = {}) {
 	}
 }
 
-function buildProductsQuery(params = {}) {
+function toBoundedInteger(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) {
+		return fallback;
+	}
+
+	const normalized = Math.trunc(parsed);
+	if (normalized < min) {
+		return min;
+	}
+	if (normalized > max) {
+		return max;
+	}
+	return normalized;
+}
+
+function wait(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getProductApiConfig() {
+	const productApi = runtimeConfig?.productApi || {};
+	const storeApi = runtimeConfig?.storeApi || {};
+
+	return {
+		baseUrl: safeTextCleanup(productApi.baseUrl || storeApi.baseUrl || ""),
+		searchPath: safeTextCleanup(productApi.searchPath || "/cards/search") || "/cards/search",
+		timeoutMs: toBoundedInteger(productApi.timeoutMs || storeApi.timeoutMs || 10000, 10000, 1000, 120000),
+		defaultLimit: toBoundedInteger(productApi.defaultLimit || 24, 24, 1, 100),
+		maxUserVisibleResults: toBoundedInteger(productApi.maxUserVisibleResults || 6, 6, 1, 20),
+		maxSearchCandidates: toBoundedInteger(productApi.maxSearchCandidates || 5, 5, 1, 12),
+		maxRetries: toBoundedInteger(productApi.maxRetries || 2, 2, 0, 5),
+		retryDelayMs: toBoundedInteger(productApi.retryDelayMs || 500, 500, 50, 10000),
+	};
+}
+
+function normalizeEndpointPath(value, fallback = "/") {
+	const normalized = safeTextCleanup(value || fallback) || fallback;
+	return normalized.startsWith("/") ? normalized : `/${normalized}`;
+}
+
+function isTransientStatusCode(statusCode) {
+	return statusCode === 408 || statusCode === 409 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
+}
+
+function isTransientNetworkError(error) {
+	const message = String(error?.message || error || "").toLowerCase();
+	return (
+		message.includes("fetch failed")
+		|| message.includes("econnreset")
+		|| message.includes("socket hang up")
+		|| message.includes("etimedout")
+		|| message.includes("timed out")
+		|| message.includes("eai_again")
+		|| message.includes("enotfound")
+	);
+}
+
+async function requestProductApi(endpoint, options = {}) {
+	const config = getProductApiConfig();
+	if (!config.baseUrl) {
+		throw new Error("PRODUCT_API_BASE_URL is not configured");
+	}
+
+	const fetch = await getFetch();
+	const normalizedEndpoint = normalizeEndpointPath(endpoint, config.searchPath);
+	const baseUrl = config.baseUrl.replace(/\/$/, "");
+	const url = `${baseUrl}${normalizedEndpoint}`;
+
+	let lastError = null;
+	for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+
+		try {
+			const response = await fetch(url, {
+				...options,
+				headers: {
+					Accept: "*/*",
+					...(options.headers || {}),
+				},
+				signal: controller.signal,
+			});
+
+			const payloadText = await response.text();
+			if (!response.ok) {
+				let message = "";
+				try {
+					const payload = parseApiPayload(payloadText);
+					message = getApiErrorMessage(payload, "");
+				} catch (_error) {
+					message = truncateForError(payloadText);
+				}
+
+				const error = new Error(`Product API ${response.status}: ${message || "Request failed"}`);
+				if (attempt < config.maxRetries && isTransientStatusCode(response.status)) {
+					lastError = error;
+					await wait(config.retryDelayMs * (attempt + 1));
+					continue;
+				}
+
+				throw error;
+			}
+
+			if (response.status === 204) {
+				return {};
+			}
+
+			try {
+				return parseApiPayload(payloadText);
+			} catch (_error) {
+				const contentType = response.headers.get("content-type") || "unknown";
+				throw new Error(`Product API returned non-JSON response (${contentType}) for ${normalizedEndpoint}`);
+			}
+		} catch (error) {
+			if (isAbortError(error)) {
+				lastError = new Error(`Product API request timed out after ${config.timeoutMs}ms (${normalizedEndpoint}).`);
+			} else {
+				lastError = error;
+			}
+
+			if (attempt < config.maxRetries && (isAbortError(error) || isTransientNetworkError(error))) {
+				await wait(config.retryDelayMs * (attempt + 1));
+				continue;
+			}
+
+			throw lastError;
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
+	throw lastError || new Error("Product API request failed.");
+}
+
+function buildLegacyProductsQuery(params = {}) {
 	const searchParams = new URLSearchParams();
 
 	for (const [key, value] of Object.entries(params)) {
@@ -439,6 +574,17 @@ function buildProductsQuery(params = {}) {
 
 	const queryString = searchParams.toString();
 	return `/api/products${queryString ? `?${queryString}` : ""}`;
+}
+
+function buildCardSearchQuery(params = {}) {
+	const searchParams = new URLSearchParams();
+	for (const [key, value] of Object.entries(params)) {
+		if (value === undefined || value === null || value === "") {
+			continue;
+		}
+		searchParams.set(key, String(value));
+	}
+	return searchParams.toString();
 }
 
 function normalizeProductsResponse(apiResult) {
@@ -461,12 +607,60 @@ function normalizeProductsResponse(apiResult) {
 	return [];
 }
 
+function normalizeCardSearchResponse(apiResult) {
+	if (Array.isArray(apiResult)) {
+		return apiResult;
+	}
+
+	const candidateArrays = [
+		apiResult?.data,
+		apiResult?.data?.cards,
+		apiResult?.data?.items,
+		apiResult?.payload?.data,
+		apiResult?.cards,
+		apiResult?.items,
+		apiResult?.results,
+		apiResult?.rows,
+	];
+	for (const value of candidateArrays) {
+		if (Array.isArray(value)) {
+			return value;
+		}
+	}
+
+	return [];
+}
+
+function shouldTryAlternateProductSearchPath(error) {
+	const message = String(error?.message || error || "").toLowerCase();
+	return (
+		message.includes("non-json response")
+		|| message.includes(" 404")
+		|| message.includes(" 405")
+		|| message.includes("cannot get")
+		|| message.includes("not found")
+	);
+}
+
+function getProductSearchPaths() {
+	const config = getProductApiConfig();
+	const primaryPath = normalizeEndpointPath(config.searchPath || "/cards/search", "/cards/search").replace(/\/+$/, "") || "/cards/search";
+	const secondaryPath = primaryPath.startsWith("/api/")
+		? primaryPath.replace(/^\/api/, "") || "/cards/search"
+		: `/api${primaryPath}`;
+	return [...new Set([primaryPath, secondaryPath].filter(Boolean))];
+}
+
 function normalizeTitleForMatch(value) {
 	return String(value || "")
 		.toLowerCase()
 		.replace(/[()[\]{}"'.,:;!?-]/g, " ")
 		.replace(/\s+/g, " ")
 		.trim();
+}
+
+function tokenizeForMatch(value) {
+	return normalizeTitleForMatch(value).split(" ").filter(Boolean);
 }
 
 function extractSetHint(...values) {
@@ -510,8 +704,365 @@ function filterProductsBySetHint(products = [], setHint = "") {
 	return filtered.length ? filtered : products;
 }
 
-async function searchProductsByCandidate(candidate, params = {}) {
-	const apiResult = await requestStoreApi(buildProductsQuery({
+function scoreProductForCandidate(product = {}, candidate = "", setHint = "") {
+	const normalizedCandidate = normalizeTitleForMatch(candidate);
+	const candidateTokens = tokenizeForMatch(candidate);
+	const title = normalizeTitleForMatch(product.title || product.original_title || "");
+	const setValue = normalizeTitleForMatch(`${product.expansion || ""} ${product.expansion_code || ""}`);
+	const setHintTokens = tokenizeForMatch(setHint);
+	const collectorNumber = normalizeTitleForMatch(product.card_number || "");
+
+	let score = 0;
+	if (title && normalizedCandidate && title === normalizedCandidate) {
+		score += 1000;
+	}
+	if (title && normalizedCandidate && title.startsWith(normalizedCandidate)) {
+		score += 700;
+	}
+
+	let tokenMatches = 0;
+	for (const token of candidateTokens) {
+		if (title.includes(token)) {
+			tokenMatches += 1;
+		}
+	}
+	score += tokenMatches * 60;
+	if (candidateTokens.length > 0 && tokenMatches === candidateTokens.length) {
+		score += 240;
+	}
+
+	if (setHintTokens.length > 0) {
+		let setMatches = 0;
+		for (const token of setHintTokens) {
+			if (setValue.includes(token)) {
+				setMatches += 1;
+			}
+		}
+		score += setMatches * 80;
+		if (setMatches === setHintTokens.length) {
+			score += 180;
+		} else if (setMatches === 0) {
+			score -= 80;
+		}
+	}
+
+	if (candidateTokens.some((token) => token === collectorNumber) && collectorNumber) {
+		score += 120;
+	}
+
+	return score;
+}
+
+function rankProductsForCandidate(products = [], candidate = "", setHint = "") {
+	return products
+		.map((product, index) => ({
+			...product,
+			_rankScore: scoreProductForCandidate(product, candidate, setHint),
+			_rankIndex: index,
+		}))
+		.sort((a, b) => {
+			if (b._rankScore !== a._rankScore) {
+				return b._rankScore - a._rankScore;
+			}
+
+			const titleCompare = normalizeTitleForMatch(a.title || a.original_title || "")
+				.localeCompare(normalizeTitleForMatch(b.title || b.original_title || ""));
+			if (titleCompare !== 0) {
+				return titleCompare;
+			}
+
+			const setCompare = normalizeTitleForMatch(a.expansion || a.expansion_code || "")
+				.localeCompare(normalizeTitleForMatch(b.expansion || b.expansion_code || ""));
+			if (setCompare !== 0) {
+				return setCompare;
+			}
+
+			const numberCompare = normalizeTitleForMatch(a.card_number || "")
+				.localeCompare(normalizeTitleForMatch(b.card_number || ""));
+			if (numberCompare !== 0) {
+				return numberCompare;
+			}
+
+			return a._rankIndex - b._rankIndex;
+		})
+		.map((product) => {
+			const { _rankScore, _rankIndex, ...cleaned } = product;
+			return cleaned;
+		});
+}
+
+function buildProductVersionKey(product = {}) {
+	const parts = [
+		product.title || product.original_title,
+		product.expansion || product.expansion_code,
+		product.card_number,
+		product.variation_code || product.finish,
+		product.id,
+	].map((value) => normalizeTitleForMatch(value));
+
+	const normalized = parts.filter(Boolean).join("|");
+	return normalized || normalizeTitleForMatch(product.title || product.original_title || "");
+}
+
+function toDistinctProducts(products = [], maxResults = 24) {
+	const distinctProducts = [];
+	const seen = new Set();
+
+	for (const product of products) {
+		const versionKey = buildProductVersionKey(product);
+		if (!versionKey || seen.has(versionKey)) {
+			continue;
+		}
+
+		seen.add(versionKey);
+		distinctProducts.push(product);
+		if (distinctProducts.length >= maxResults) {
+			break;
+		}
+	}
+
+	return distinctProducts;
+}
+
+function extractResultTotal(apiResult, fallbackCount = 0) {
+	const candidates = [
+		apiResult?.total,
+		apiResult?.count,
+		apiResult?.totalCount,
+		apiResult?.total_count,
+		apiResult?.totalElements,
+		apiResult?.meta?.total,
+		apiResult?.meta?.totalCount,
+		apiResult?.meta?.total_count,
+	];
+
+	for (const value of candidates) {
+		const numeric = Number(value);
+		if (Number.isFinite(numeric) && numeric >= 0) {
+			return numeric;
+		}
+	}
+
+	return fallbackCount;
+}
+
+function finalizeProductSearchResult({
+	apiResult,
+	products = [],
+	candidate = "",
+	candidates = [],
+	setHint = "",
+	source = "card_catalog_api",
+}) {
+	const productApiConfig = getProductApiConfig();
+	const maxVisible = toBoundedInteger(productApiConfig.maxUserVisibleResults, 6, 1, 20);
+	const maxDistinct = Math.max(maxVisible, toBoundedInteger(productApiConfig.defaultLimit, 24, 1, 100));
+	const distinctProducts = toDistinctProducts(products, maxDistinct);
+	const visibleProducts = distinctProducts.slice(0, maxVisible);
+
+	return {
+		success: true,
+		source,
+		products: visibleProducts,
+		totalMatches: extractResultTotal(apiResult, products.length),
+		distinctVersionCount: distinctProducts.length,
+		pagination: {
+			current_page: apiResult?.current_page,
+			last_page: apiResult?.last_page,
+			per_page: apiResult?.per_page,
+			total: apiResult?.total,
+		},
+		raw: apiResult,
+		searchCandidatesTried: candidates,
+		matchedCandidate: candidate,
+		setHintUsed: setHint,
+	};
+}
+
+function toNumber(value) {
+	const numeric = Number(value);
+	return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function summarizeCondition(condition = {}) {
+	return {
+		code: condition.code || condition.condition || condition.condition_code,
+		price: resolveFirstRawValue([condition.price, condition.amount, condition.value]),
+		stocks: toNumber(condition.stocks ?? condition.stock ?? condition.quantity),
+		usd_price: resolveFirstRawValue([condition.usd_price, condition.usdPrice]),
+	};
+}
+
+function resolveCardPrice(product = {}) {
+	const directCandidates = [
+		product.price,
+		product.usd_price,
+		product.usdPrice,
+		product.market_price,
+		product.marketPrice,
+		product.low_price,
+		product.lowPrice,
+		product.retail_price,
+		product.retailPrice,
+		product.eur_price,
+		product.eurPrice,
+		product.price_usd,
+	];
+
+	for (const candidate of directCandidates) {
+		const numeric = toNumberValue(candidate);
+		if (numeric !== null) {
+			return numeric;
+		}
+	}
+
+	return resolveFirstRawValue(directCandidates);
+}
+
+function summarizeProduct(product = {}) {
+	const conditions = Array.isArray(product.conditions) ? product.conditions : [];
+	const availableConditions = conditions
+		.map(summarizeCondition)
+		.filter((condition) => condition.stocks > 0);
+	const totalStocksRaw = resolveFirstRawValue([
+		product.totalStocks,
+		product.total_stocks,
+		product.stock,
+		product.quantity,
+	]);
+	const totalStocksNumber = toNumberValue(totalStocksRaw);
+	const hasKnownStock = totalStocksNumber !== null || availableConditions.length > 0;
+
+	return {
+		id: resolveFirstRawValue([
+			product.id,
+			product.uuid,
+			product.card_id,
+			product.cardId,
+			product.scryfall_id,
+		]),
+		title: resolveFirstDisplayValue([
+			product.title,
+			product.name,
+			product.card_name,
+			product.cardName,
+			product.oracle_name,
+		]),
+		original_title: resolveFirstDisplayValue([
+			product.original_title,
+			product.originalTitle,
+			product.name,
+			product.card_name,
+		]),
+		expansion_code: resolveFirstDisplayValue([
+			product.expansion_code,
+			product.expansionCode,
+			product.set_code,
+			product.setCode,
+			product.set_id,
+			product.setId,
+		]),
+		expansion: resolveFirstDisplayValue([
+			product.expansion,
+			product.set_name,
+			product.setName,
+			product.set,
+			product.edition,
+			product.edition_name,
+			product.editionName,
+		]),
+		card_number: resolveFirstDisplayValue([
+			product.card_number,
+			product.cardNumber,
+			product.collector_number,
+			product.collectorNumber,
+			product.number,
+		]),
+		rarity_code: resolveFirstDisplayValue([
+			product.rarity_code,
+			product.rarityCode,
+			product.rarity,
+		]),
+		rarity: resolveFirstDisplayValue([
+			product.rarity,
+			product.rarity_name,
+			product.rarityName,
+			product.rarity_code,
+		]),
+		type_code: resolveFirstDisplayValue([
+			product.type_code,
+			product.typeCode,
+			product.layout,
+		]),
+		variation_code: resolveFirstDisplayValue([
+			product.variation_code,
+			product.variationCode,
+			product.finish,
+			product.printing,
+			product.frame_effect,
+			product.frameEffect,
+		]),
+		price: resolveCardPrice(product),
+		totalStocks: hasKnownStock ? totalStocksNumber : null,
+		default_condition_code: resolveFirstDisplayValue([
+			product.default_condition_code,
+			product.defaultConditionCode,
+		]),
+		available: hasKnownStock ? (toNumber(totalStocksNumber) > 0 || availableConditions.length > 0) : null,
+		available_conditions: hasKnownStock ? availableConditions : [],
+		mana_cost: resolveFirstDisplayValue([
+			product.mana_cost,
+			product.manaCost,
+		]),
+		mana_value: resolveFirstRawValue([
+			product.mana_value,
+			product.manaValue,
+			product.cmc,
+			product.converted_mana_cost,
+		]),
+		artist: resolveFirstDisplayValue([
+			product.artist,
+		]),
+		ability: resolveFirstDisplayValue([
+			product.ability,
+			product.oracle_text,
+			product.oracleText,
+			product.text,
+		]),
+		ruling: resolveFirstDisplayValue([
+			product.ruling,
+			product.flavor_text,
+			product.flavorText,
+		]),
+		scryfall_id: resolveFirstDisplayValue([
+			product.scryfall_id,
+			product.scryfallId,
+		]),
+		type_line: resolveFirstDisplayValue([
+			product.type_line,
+			product.typeLine,
+			product.type,
+		]),
+		image_url: resolveFirstDisplayValue([
+			product.image_url,
+			product.imageUrl,
+			product.image,
+			product.image_uri,
+			product.imageUri,
+			product?.image_uris?.normal,
+			product?.image_uris?.small,
+		]),
+		release_date: resolveFirstDisplayValue([
+			product.released_at,
+			product.release_date,
+			product.releaseDate,
+		]),
+		stock_unavailable: !hasKnownStock,
+	};
+}
+
+async function searchProductsByCandidateLegacy(candidate, params = {}) {
+	const apiResult = await requestStoreApi(buildLegacyProductsQuery({
 		search: candidate,
 		category_id: params.category_id || params.category,
 		expansion_code: params.expansion_code,
@@ -528,7 +1079,67 @@ async function searchProductsByCandidate(candidate, params = {}) {
 	return {
 		apiResult,
 		products,
+		source: "store_api",
 	};
+}
+
+function isLegacyFallbackError(error) {
+	const message = String(error?.message || error || "").toLowerCase();
+	return (
+		message.includes(" 404")
+		|| message.includes(" 405")
+		|| message.includes("not found")
+		|| message.includes("cannot get")
+	);
+}
+
+async function searchProductsByCandidateCardApi(candidate, params = {}) {
+	const productApiConfig = getProductApiConfig();
+	const limit = toBoundedInteger(params.limit || productApiConfig.defaultLimit, productApiConfig.defaultLimit, 1, 100);
+	const offset = toBoundedInteger(params.offset || 0, 0, 0, 10000);
+	const searchPaths = getProductSearchPaths();
+	let lastError = null;
+
+	for (const searchPath of searchPaths) {
+		const queryString = buildCardSearchQuery({
+			offset,
+			limit,
+			fuzzyName: candidate,
+		});
+		const endpoint = `${searchPath}${queryString ? `?${queryString}` : ""}`;
+
+		try {
+			const apiResult = await requestProductApi(endpoint);
+			const products = normalizeCardSearchResponse(apiResult).map(summarizeProduct);
+
+			return {
+				apiResult,
+				products,
+				source: "card_catalog_api",
+				searchPathUsed: searchPath,
+			};
+		} catch (error) {
+			lastError = error;
+			if (shouldTryAlternateProductSearchPath(error)) {
+				continue;
+			}
+			throw error;
+		}
+	}
+
+	throw lastError || new Error("Product API search failed.");
+}
+
+async function searchProductsByCandidate(candidate, params = {}) {
+	try {
+		return await searchProductsByCandidateCardApi(candidate, params);
+	} catch (error) {
+		if (!runtimeConfig?.storeApi?.baseUrl || !isLegacyFallbackError(error)) {
+			throw error;
+		}
+
+		return searchProductsByCandidateLegacy(candidate, params);
+	}
 }
 
 async function searchWithFallback(params = {}, context = {}) {
@@ -544,7 +1155,7 @@ async function searchWithFallback(params = {}, context = {}) {
 			params.query,
 		),
 	);
-	const candidates = buildSearchCandidates({
+	const builtCandidates = buildSearchCandidates({
 		explicitCandidates,
 		values: [
 			params.search,
@@ -553,12 +1164,23 @@ async function searchWithFallback(params = {}, context = {}) {
 		],
 		setHint,
 	});
+	const maxSearchCandidates = toBoundedInteger(
+		params.max_search_candidates || getProductApiConfig().maxSearchCandidates,
+		getProductApiConfig().maxSearchCandidates,
+		1,
+		12,
+	);
+	const candidates = builtCandidates.slice(0, maxSearchCandidates);
 
 	if (!candidates.length) {
 		return {
 			success: true,
-			source: "store_api",
+			source: "card_catalog_api",
 			products: [],
+			searchCandidatesTried: [],
+			setHintUsed: setHint,
+			totalMatches: 0,
+			distinctVersionCount: 0,
 		};
 	}
 
@@ -567,8 +1189,9 @@ async function searchWithFallback(params = {}, context = {}) {
 	let firstRawNonEmptyResult = null;
 
 	for (const candidate of candidates) {
-		const { apiResult, products } = await searchProductsByCandidate(candidate, params);
-		const scopedProducts = filterProductsBySetHint(products, setHint);
+		const { apiResult, products, source } = await searchProductsByCandidate(candidate, params);
+		const scopedProducts = rankProductsForCandidate(filterProductsBySetHint(products, setHint), candidate, setHint);
+		const rankedProducts = rankProductsForCandidate(products, candidate, setHint);
 		const exactProducts = scopedProducts.filter((product) => {
 			const possibleTitles = [
 				product.title,
@@ -578,57 +1201,36 @@ async function searchWithFallback(params = {}, context = {}) {
 		});
 
 		if (exactProducts.length > 0) {
-			return {
-				success: true,
-				source: "store_api",
+			return finalizeProductSearchResult({
+				apiResult,
 				products: exactProducts,
-				pagination: {
-					current_page: apiResult.current_page,
-					last_page: apiResult.last_page,
-					per_page: apiResult.per_page,
-					total: apiResult.total,
-				},
-				raw: apiResult,
-				searchCandidatesTried: candidates,
-				matchedCandidate: candidate,
-				setHintUsed: setHint,
-			};
+				candidate,
+				candidates,
+				setHint,
+				source,
+			});
 		}
 
 		if (!firstFilteredNonEmptyResult && scopedProducts.length > 0) {
-			firstFilteredNonEmptyResult = {
-				success: true,
-				source: "store_api",
+			firstFilteredNonEmptyResult = finalizeProductSearchResult({
+				apiResult,
 				products: scopedProducts,
-				pagination: {
-					current_page: apiResult.current_page,
-					last_page: apiResult.last_page,
-					per_page: apiResult.per_page,
-					total: apiResult.total,
-				},
-				raw: apiResult,
-				searchCandidatesTried: candidates,
-				matchedCandidate: candidate,
-				setHintUsed: setHint,
-			};
+				candidate,
+				candidates,
+				setHint,
+				source,
+			});
 		}
 
-		if (!firstRawNonEmptyResult && products.length > 0) {
-			firstRawNonEmptyResult = {
-				success: true,
-				source: "store_api",
-				products,
-				pagination: {
-					current_page: apiResult.current_page,
-					last_page: apiResult.last_page,
-					per_page: apiResult.per_page,
-					total: apiResult.total,
-				},
-				raw: apiResult,
-				searchCandidatesTried: candidates,
-				matchedCandidate: candidate,
-				setHintUsed: setHint,
-			};
+		if (!firstRawNonEmptyResult && rankedProducts.length > 0) {
+			firstRawNonEmptyResult = finalizeProductSearchResult({
+				apiResult,
+				products: rankedProducts,
+				candidate,
+				candidates,
+				setHint,
+				source,
+			});
 		}
 	}
 
@@ -642,55 +1244,12 @@ async function searchWithFallback(params = {}, context = {}) {
 
 	return {
 		success: true,
-		source: "store_api",
+		source: "card_catalog_api",
 		products: [],
 		searchCandidatesTried: candidates,
 		setHintUsed: setHint,
-	};
-}
-
-function toNumber(value) {
-	const numeric = Number(value);
-	return Number.isFinite(numeric) ? numeric : 0;
-}
-
-function summarizeCondition(condition) {
-	return {
-		code: condition.code,
-		price: condition.price,
-		stocks: toNumber(condition.stocks),
-		usd_price: condition.usd_price,
-	};
-}
-
-function summarizeProduct(product) {
-	const conditions = Array.isArray(product.conditions) ? product.conditions : [];
-	const availableConditions = conditions
-		.map(summarizeCondition)
-		.filter((condition) => condition.stocks > 0);
-
-	return {
-		id: product.id,
-		title: product.title,
-		original_title: product.original_title,
-		expansion_code: product.expansion_code,
-		expansion: product.expansion,
-		card_number: product.card_number,
-		rarity_code: product.rarity_code,
-		rarity: product.rarity,
-		type_code: product.type_code,
-		variation_code: product.variation_code,
-		price: product.price,
-		totalStocks: toNumber(product.totalStocks),
-		default_condition_code: product.default_condition_code,
-		available: toNumber(product.totalStocks) > 0 || availableConditions.length > 0,
-		available_conditions: availableConditions,
-		mana_cost: product.mana_cost,
-		mana_value: product.mana_value,
-		artist: product.artist,
-		ability: product.ability,
-		ruling: product.ruling,
-		scryfall_id: product.scryfall_id,
+		totalMatches: 0,
+		distinctVersionCount: 0,
 	};
 }
 
@@ -708,6 +1267,7 @@ async function searchProducts({
 	search_candidates,
 	canonical_name,
 	set_hint,
+	offset,
 	category,
 	category_id,
 	expansion_code,
@@ -717,6 +1277,7 @@ async function searchProducts({
 	in_stock,
 	is_paginated,
 	limit,
+	max_search_candidates,
 	order_by,
 	originalMessage,
 }) {
@@ -727,6 +1288,7 @@ async function searchProducts({
 			search_candidates,
 			canonical_name,
 			set_hint,
+			offset,
 			category,
 			category_id,
 			expansion_code,
@@ -736,6 +1298,7 @@ async function searchProducts({
 			in_stock,
 			is_paginated,
 			limit,
+			max_search_candidates,
 			order_by,
 		}, {
 			originalMessage,
@@ -743,7 +1306,7 @@ async function searchProducts({
 	} catch (error) {
 		return {
 			success: false,
-			source: "store_api",
+			source: "card_catalog_api",
 			error: error.message,
 		};
 	}
@@ -768,13 +1331,17 @@ async function getProductDetails({
 
 	try {
 		if (identifier && /^\d+$/.test(identifier)) {
-			const apiResult = await requestStoreApi(`/api/products/${encodeURIComponent(identifier)}`);
-			return {
-				success: true,
-				source: "store_api",
-				product: summarizeProduct(apiResult.product || apiResult.data || apiResult),
-				raw: apiResult,
-			};
+			try {
+				const apiResult = await requestStoreApi(`/api/products/${encodeURIComponent(identifier)}`);
+				return {
+					success: true,
+					source: "store_api",
+					product: summarizeProduct(apiResult.product || apiResult.data || apiResult),
+					raw: apiResult,
+				};
+			} catch (_legacyProductDetailsError) {
+				// Continue with fuzzy card search path when legacy product-id lookup is unavailable.
+			}
 		}
 
 		const searchResult = await searchWithFallback({
@@ -787,8 +1354,6 @@ async function getProductDetails({
 			variation_code,
 			rarity_code,
 			type_code,
-			in_stock: true,
-			is_paginated: true,
 			limit: 10,
 		}, {
 			originalMessage,
@@ -797,7 +1362,7 @@ async function getProductDetails({
 		const products = Array.isArray(searchResult.products) ? searchResult.products : [];
 		return {
 			success: products.length > 0,
-			source: "store_api",
+			source: searchResult.source || "card_catalog_api",
 			product: products[0] || null,
 			raw: searchResult.raw,
 			...(products.length === 0 ? { error: `No product matched "${identifier}"` } : {}),
@@ -805,7 +1370,7 @@ async function getProductDetails({
 	} catch (error) {
 		return {
 			success: false,
-			source: "store_api",
+			source: "card_catalog_api",
 			error: error.message,
 		};
 	}
@@ -1662,40 +2227,34 @@ function getToolDeclarations() {
 	return [
 		{
 			name: "searchProducts",
-			description: "Search the MTG store catalog for singles, sealed product, or accessories.",
+			description: "Search MTG cards using fuzzy name matching and return a few distinct card versions.",
 			parametersJsonSchema: {
 				type: "object",
 				properties: {
-					query: { type: "string", description: "Product keywords from the customer." },
-					search: { type: "string", description: "Search string for /api/products." },
-					category_id: { type: "string", description: "Category ID filter." },
-					expansion_code: { type: "string", description: "Expansion code filter such as LEA." },
-					variation_code: { type: "string", description: "Variation code filter." },
-					rarity_code: { type: "string", description: "Rarity code filter." },
-					type_code: { type: "string", description: "Type code filter." },
-					in_stock: { type: "boolean", description: "Filter to in-stock products." },
-					is_paginated: { type: "boolean", description: "Whether to request paginated results." },
-					limit: { type: "number", description: "Maximum number of results." },
-					order_by: { type: "string", description: "Sort order such as Price High to Low." },
+					query: { type: "string", description: "Card name or MTG product keywords from the customer." },
+					search: { type: "string", description: "Alias of query for fuzzy card search." },
+					search_candidates: { type: "array", items: { type: "string" }, description: "Optional candidate names to try in deterministic order." },
+					canonical_name: { type: "string", description: "Preferred exact canonical card name if known." },
+					set_hint: { type: "string", description: "Optional set/edition hint to rank versions." },
+					offset: { type: "number", description: "Pagination offset for card search." },
+					limit: { type: "number", description: "Maximum API matches to request before ranking." },
 				},
 				required: [],
 			},
 		},
 		{
 			name: "getProductDetails",
-			description: "Get product details by product ID if available, otherwise search for the closest product match.",
+			description: "Get card details for the best fuzzy match when an exact product identifier is unavailable.",
 			parametersJsonSchema: {
 				type: "object",
 				properties: {
 					id: { type: "string", description: "Product ID for /api/products/{id} if known." },
 					product_id: { type: "string", description: "Alias for product ID." },
-					search: { type: "string", description: "Search string when an exact product ID is not known." },
+					search: { type: "string", description: "Card name search string when exact product ID is not known." },
 					query: { type: "string", description: "Alias for search string." },
-					category_id: { type: "string", description: "Optional category ID filter." },
-					expansion_code: { type: "string", description: "Optional expansion code filter." },
-					variation_code: { type: "string", description: "Optional variation code filter." },
-					rarity_code: { type: "string", description: "Optional rarity code filter." },
-					type_code: { type: "string", description: "Optional type code filter." },
+					search_candidates: { type: "array", items: { type: "string" }, description: "Optional candidate names to try in deterministic order." },
+					canonical_name: { type: "string", description: "Preferred exact canonical card name if known." },
+					set_hint: { type: "string", description: "Optional set/edition hint to rank versions." },
 				},
 				required: [],
 			},

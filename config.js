@@ -106,6 +106,8 @@ module.exports = {
 		},
 		rag: {
 			enabled: parseBoolean(process.env.RAG_ENABLED, true),
+			crawlOnStartup: parseBoolean(process.env.RAG_CRAWL_ENABLED, true),
+			scheduleDailyCrawl: parseBoolean(process.env.RAG_DAILY_CRAWL_ENABLED, true),
 		},
 		rulesGrounding: {
 			enabled: parseBoolean(process.env.RULES_GROUNDING_ENABLED, false),
@@ -116,6 +118,25 @@ module.exports = {
 		baseUrl: process.env.STORE_API_BASE_URL || "",
 		apiKey: process.env.STORE_API_KEY || "",
 		timeoutMs: Number(process.env.STORE_API_TIMEOUT_MS || 10000),
+	},
+	productApi: {
+		baseUrl: process.env.PRODUCT_API_BASE_URL
+			|| process.env.CARD_API_BASE_URL
+			|| process.env.STORE_PRODUCT_API_BASE_URL
+			|| "https://api.mtg.cardnoble.cloud"
+			|| "",
+		searchPath: process.env.PRODUCT_API_SEARCH_PATH || "/cards/search",
+		timeoutMs: parseDurationMs(
+			process.env.PRODUCT_API_TIMEOUT_MS
+			|| process.env.PRODUCT_API_TIMEOUT
+			|| process.env.STORE_API_TIMEOUT_MS,
+			10000,
+		),
+		defaultLimit: Number(process.env.PRODUCT_API_LIMIT || 24),
+		maxUserVisibleResults: Number(process.env.PRODUCT_API_MAX_VISIBLE_RESULTS || 6),
+		maxSearchCandidates: Number(process.env.PRODUCT_API_MAX_SEARCH_CANDIDATES || 5),
+		maxRetries: Number(process.env.PRODUCT_API_MAX_RETRIES || 2),
+		retryDelayMs: parseDurationMs(process.env.PRODUCT_API_RETRY_DELAY_MS || "500ms", 500),
 	},
 	moxApi: {
 		baseUrl: process.env.MOX_API_BASE_URL || "",

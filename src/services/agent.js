@@ -178,7 +178,6 @@ function detectRoute(originalText, normalizedText, history = []) {
 
 	if (
 		includesAny(normalizedText, EVENT_KEYWORDS)
-		includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
 		|| includesAny(normalizedText, VOUCHER_KEYWORDS)
 		|| includesAny(normalizedText, SUPPORT_KEYWORDS)
 		|| includesAny(normalizedText, PRODUCT_KEYWORDS)
@@ -542,14 +541,11 @@ function pushDisplayLine(lines, label, value, formatter) {
 
 function formatConditionSummary(conditions = []) {
 	return conditions
-		.filter((condition) => Number(condition?.stocks) > 0)
 		.map((condition) => {
 			const parts = [];
 			if (hasDisplayValue(condition.code)) {
 				parts.push(String(condition.code).trim());
 			}
-
-			parts.push(`${Number(condition.stocks)} in stock`);
 
 			const price = formatCurrency(condition.price || condition.usd_price);
 			if (price) {
@@ -580,13 +576,36 @@ function formatProductBlock(product, index) {
 	const lines = [`${index}. ${product.title || product.original_title || "Product"}`];
 
 	pushDisplayLine(lines, "Set", product.expansion || product.expansion_code);
+	pushDisplayLine(lines, "Set code", product.expansion_code);
 	pushDisplayLine(lines, "Rarity", product.rarity || product.rarity_code);
 	pushDisplayLine(lines, "Card number", product.card_number);
-	pushDisplayLine(lines, "Stock", Number(product.totalStocks) > 0 ? `${Number(product.totalStocks)} total` : "");
+	pushDisplayLine(lines, "Type", product.type_line);
+	pushDisplayLine(lines, "Mana cost", product.mana_cost);
+	pushDisplayLine(lines, "Mana value", product.mana_value);
+	pushDisplayLine(lines, "Print variant", product.variation_code);
 	pushDisplayLine(lines, "Starting price", getStartingPrice(product), formatCurrency);
 	pushDisplayLine(lines, "Conditions", formatConditionSummary(product.available_conditions));
+	pushDisplayLine(lines, "Artist", product.artist);
 
 	return lines.join("\n");
+}
+
+function isStockAvailabilityQuestion(text = "") {
+	const normalized = safeTextCleanup(text).toLowerCase();
+	if (!normalized) {
+		return false;
+	}
+
+	return /\b(stock|stocks|availability|available|qty|quantity|how many)\b/.test(normalized);
+}
+
+function buildStockAvailabilityReply() {
+	const websiteUrl = safeTextCleanup(runtimeConfig?.storeInfo?.websiteUrl || "");
+	if (websiteUrl) {
+		return `Live stock quantities are not available in this chat. Please check the Mox and Lotus site for current stock: ${websiteUrl}`;
+	}
+
+	return "Live stock quantities are not available in this chat. Please check the Mox and Lotus site for current stock.";
 }
 
 function getRequestedLookupLabel(execution, fallbackText) {
@@ -602,12 +621,49 @@ function getRequestedLookupLabel(execution, fallbackText) {
 		|| "your search";
 }
 
+function isTechnicalProductLookupError(errorMessage = "") {
+	const normalized = safeTextCleanup(errorMessage).toLowerCase();
+	if (!normalized) {
+		return false;
+	}
+
+	return (
+		normalized.includes("non-json response")
+		|| normalized.includes("timed out")
+		|| normalized.includes("timeout")
+		|| normalized.includes("fetch failed")
+		|| normalized.includes("econn")
+		|| normalized.includes("product api")
+		|| /\b(?:4\d\d|5\d\d)\b/.test(normalized)
+	);
+}
+
+function buildProductLookupFailureReply(execution, fallbackText) {
+	const requested = getRequestedLookupLabel(execution, fallbackText);
+	const websiteUrl = safeTextCleanup(runtimeConfig?.storeInfo?.websiteUrl || "");
+	const websiteHint = websiteUrl
+		? `You can also check the Mox and Lotus site directly: ${websiteUrl}`
+		: "You can also check the Mox and Lotus site directly.";
+
+	const technicalError = safeTextCleanup(execution?.result?.error || "");
+	if (isTechnicalProductLookupError(technicalError)) {
+		return [
+			`I could not check live card results for "${requested}" right now.`,
+			"Please try again in a moment with the exact card name.",
+			websiteHint,
+		].join(" ");
+	}
+
+	return [
+		`I could not retrieve product information for "${requested}" right now.`,
+		"Please try the exact card name, set name, or collector number.",
+	].join(" ");
+}
+
 function formatProductSearchReply(execution, fallbackText) {
 	const result = execution?.result || {};
 	if (!result.success) {
-		return hasDisplayValue(result.error)
-			? `I could not retrieve product information right now. ${result.error}`
-			: "I could not retrieve product information right now.";
+		return buildProductLookupFailureReply(execution, fallbackText);
 	}
 
 	const products = Array.isArray(result.products) ? result.products : [];
@@ -617,28 +673,46 @@ function formatProductSearchReply(execution, fallbackText) {
 	}
 
 	const visibleProducts = products.slice(0, 6);
+	const distinctVersions = Number(result.distinctVersionCount);
+	const totalMatches = Number(result.totalMatches);
+	const hasDistinctCount = Number.isFinite(distinctVersions) && distinctVersions > 0;
+	const hasTotalMatches = Number.isFinite(totalMatches) && totalMatches > 0;
 	const header = [
 		`Matching products for "${requested}":`,
+		hasDistinctCount ? `Found ${distinctVersions} distinct versions.` : "",
+		hasTotalMatches && totalMatches > distinctVersions ? `${totalMatches} total matches from the card catalog.` : "",
 		products.length > visibleProducts.length ? `Showing the first ${visibleProducts.length} results.` : "",
 	].filter(Boolean).join(" ");
+	const shouldSuggestVersionClarification = (
+		visibleProducts.length > 1
+		|| (hasDistinctCount && distinctVersions > visibleProducts.length)
+		|| (hasTotalMatches && totalMatches > visibleProducts.length)
+	);
+	const clarification = shouldSuggestVersionClarification
+		? "If this is not the exact version you want, reply with the set name and collector number, and I will narrow it down."
+		: "";
+	const stockNotice = isStockAvailabilityQuestion(fallbackText) ? buildStockAvailabilityReply() : "";
 
 	return [
 		header,
 		...visibleProducts.map((product, index) => formatProductBlock(product, index + 1)),
+		clarification,
+		stockNotice,
 	].join("\n\n");
 }
 
 function formatProductDetailsReply(execution, fallbackText) {
 	const result = execution?.result || {};
 	if (!result.success || !result.product) {
-		return hasDisplayValue(result.error)
-			? `I could not find product details. ${result.error}`
-			: `I could not find product details for "${getRequestedLookupLabel(execution, fallbackText)}".`;
+		return buildProductLookupFailureReply(execution, fallbackText);
 	}
+
+	const stockNotice = isStockAvailabilityQuestion(fallbackText) ? buildStockAvailabilityReply() : "";
 
 	return [
 		"Product details:",
 		formatProductBlock(result.product, 1).replace(/^1\.\s/, ""),
+		stockNotice,
 	].join("\n\n");
 }
 
@@ -1218,9 +1292,8 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 	}
 
 	const normalizedText = cleanedText.toLowerCase();
-	let route = detectRoute(cleanedText, normalizedText);
 	const history = getHistory(chatId);
-	const route = detectRoute(cleanedText, normalizedText, history);
+	let route = detectRoute(cleanedText, normalizedText, history);
 
 	// AI Intent Classification for ambiguous queries
 	if (route.type === "out_of_scope") {
