@@ -1,10 +1,10 @@
 # Frequently Asked Questions
 
-## What is Mana Junction?
-Mana Junction is a premium Magic: The Gathering (MTG) store based in Colombo, Sri Lanka. We specialize in singles, sealed products, accessories, and community events.
+## What is Mox & Lotus?
+Mox & Lotus is a premium Magic: The Gathering (MTG) store based in Singapore. We specialize in singles, sealed products, accessories, and community events.
 
 ## Where is the store located?
-We are located in Colombo, Sri Lanka. Our physical store is open for players and collectors to browse and play.
+We are located in Bedok North, Singapore. Our physical store is open for players and collectors to browse and play.
 
 ## What are your opening hours?
 We are open Tuesday to Sunday, from 11:00 AM to 8:00 PM. We are closed on Mondays.
