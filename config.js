@@ -10,6 +10,44 @@ function parseBoolean(value, fallback = false) {
 	return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
+function parseDurationMs(value, fallback = 10000) {
+	if (value === undefined || value === null || value === "") {
+		return fallback;
+	}
+
+	const raw = String(value).trim().toLowerCase();
+	if (!raw) {
+		return fallback;
+	}
+
+	const parseNumeric = (text) => {
+		const number = Number(text);
+		return Number.isFinite(number) && number > 0 ? number : null;
+	};
+
+	if (/^\d+(?:\.\d+)?\s*ms$/.test(raw)) {
+		const valueMs = parseNumeric(raw.replace(/\s*ms$/, ""));
+		return valueMs ? Math.round(valueMs) : fallback;
+	}
+
+	if (/^\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)$/.test(raw)) {
+		const valueSeconds = parseNumeric(raw.replace(/\s*(?:s|sec|secs|second|seconds)$/, ""));
+		return valueSeconds ? Math.round(valueSeconds * 1000) : fallback;
+	}
+
+	if (/^\d+(?:\.\d+)?$/.test(raw)) {
+		const numeric = parseNumeric(raw);
+		if (!numeric) {
+			return fallback;
+		}
+
+		// Backward compatibility: values like "30" were often provided as seconds.
+		return numeric <= 120 ? Math.round(numeric * 1000) : Math.round(numeric);
+	}
+
+	return fallback;
+}
+
 function getDefaultPuppeteerArgs() {
 	const baseArgs = [
 		"--no-sandbox",
@@ -44,6 +82,17 @@ module.exports = {
 		enabled: true,
 		provider: "gemini",
 		model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+		auth: {
+			mode: String(process.env.GEMINI_AUTH_MODE || "auto").trim().toLowerCase(),
+			apiKey: process.env.GEMINI_API_KEY || "",
+			vertexAi: {
+				enabled: parseBoolean(process.env.GEMINI_USE_VERTEX_AI, false),
+				project: process.env.GOOGLE_CLOUD_PROJECT || "",
+				location: process.env.GOOGLE_CLOUD_LOCATION || "",
+				applicationCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS || "",
+				apiVersion: process.env.GEMINI_VERTEX_API_VERSION || "",
+			},
+		},
 		systemPrompt: getSystemPrompt(),
 		memory: {
 			enabled: true,
@@ -67,6 +116,13 @@ module.exports = {
 		baseUrl: process.env.STORE_API_BASE_URL || "",
 		apiKey: process.env.STORE_API_KEY || "",
 		timeoutMs: Number(process.env.STORE_API_TIMEOUT_MS || 10000),
+	},
+	moxApi: {
+		baseUrl: process.env.MOX_API_BASE_URL || "",
+		username: process.env.MOX_API_USERNAME || "",
+		password: process.env.MOX_API_PASSWORD || "",
+		userType: process.env.MOX_API_USER_TYPE || "Customer",
+		timeoutMs: parseDurationMs(process.env.MOX_API_TIMEOUT, 10000),
 	},
 
 	rag: {

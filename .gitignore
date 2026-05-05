@@ -46,6 +46,7 @@ desktop.ini
 
 # Secrets & Credentials
 google_calendar_credentials.json
+service-account-key.json
 *.pem
 *.key
 *.p12
