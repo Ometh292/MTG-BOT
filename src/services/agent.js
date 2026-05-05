@@ -36,7 +36,7 @@ const EVENT_KEYWORDS = ["event", "fnm", "draft", "prerelease", "commander night"
 const VOUCHER_KEYWORDS = ["voucher", "promo code", "coupon", "discount code", "gift card"];
 const SUPPORT_KEYWORDS = ["support", "issue", "problem", "damaged", "missing", "wrong item", "need help"];
 const PRODUCT_KEYWORDS = ["product", "stock", "available", "price", "booster", "box", "bundle", "single", "card", "sleeves", "playmat", "deck box"];
-const FAQ_KEYWORDS = ["faq", "frequently asked", "how do i", "how does", "what is", "can i", "do you", "when do", "opening hours", "contact", "email", "phone number"];
+const FAQ_KEYWORDS = ["faq", "frequently asked", "how do i", "how does", "what is", "can i", "do you", "when do", "opening hours", "contact", "email", "phone number", "mobile number", "whatsapp", "website", "social media", "facebook", "address", "location"];
 const SHIPPING_KEYWORDS = ["shipping", "delivery", "ship", "deliver", "postage", "courier", "dispatch", "free shipping", "tracking"];
 const UNSUPPORTED_ACTION_KEYWORDS = ["place order", "buy this", "reserve this", "hold this for me", "register me", "sign me up"];
 const IMAGE_KEYWORDS = ["picture", "pictures", "image", "images", "photo", "photos", "pic", "pics", "artwork", "art of"];
@@ -178,7 +178,7 @@ function detectRoute(originalText, normalizedText, history = []) {
 
 	if (
 		includesAny(normalizedText, EVENT_KEYWORDS)
-		includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
+		|| includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
 		|| includesAny(normalizedText, VOUCHER_KEYWORDS)
 		|| includesAny(normalizedText, SUPPORT_KEYWORDS)
 		|| includesAny(normalizedText, PRODUCT_KEYWORDS)
@@ -1138,7 +1138,8 @@ async function handleRagRoute(text, history) {
 	const prompt = [
 		"Answer the user using only the supplied knowledge snippets.",
 		"Be concise and store-support focused.",
-		"If the snippets are incomplete, say that the answer needs staff confirmation.",
+		"Snippets may contain social media links (Facebook, Shopee), addresses, or contact info. If you see a link, you can confirm it exists.",
+		"If the snippets are incomplete or do not contain the answer at all, say that the answer needs staff confirmation.",
 		"",
 		context,
 		"",
@@ -1218,9 +1219,8 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 	}
 
 	const normalizedText = cleanedText.toLowerCase();
-	let route = detectRoute(cleanedText, normalizedText);
 	const history = getHistory(chatId);
-	const route = detectRoute(cleanedText, normalizedText, history);
+	let route = detectRoute(cleanedText, normalizedText, history);
 
 	// AI Intent Classification for ambiguous queries
 	if (route.type === "out_of_scope") {
@@ -1230,7 +1230,7 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 					"You classify customer intent for an MTG store bot.",
 					"Return JSON only: {'intent': 'product_lookup' | 'store_faq' | 'out_of_scope'}",
 					"If asking to buy, check stock, or find specific MTG cards, sealed products, or accessories, use 'product_lookup'.",
-					"If asking about store founders, hours, location, vision, return policy, or general questions, use 'store_faq'.",
+					"If asking about store founders, hours, location, contact details (phone, email, website, social media), vision, return policy, or general questions, use 'store_faq'.",
 					"If conversational or unrelated, use 'out_of_scope'."
 				].join("\n"),
 				history: [],
