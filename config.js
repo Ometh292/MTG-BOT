@@ -126,14 +126,19 @@ module.exports = {
 	},
 
 	rag: {
+		// Folder containing .md knowledge files (auto-indexed on startup)
 		sourcePath: process.env.RAG_SOURCE_PATH || path.join(__dirname, "rag"),
-		categories: ["policies", "buylist"],
+		// Local vectra vector-index storage directory
+		indexPath: process.env.RAG_INDEX_PATH || path.join(__dirname, "rag", ".vector-index"),
+		categories: ["policies", "buylist", "faq", "shipping", "events", "general"],
 		maxResults: Number(process.env.RAG_MAX_RESULTS || 3),
-		remote: {
-			baseUrl: process.env.MOX_RAG_BASE_URL || "http://localhost:8000",
-			tenantId: process.env.MOX_RAG_TENANT_ID || "default",
-			timeoutMs: Number(process.env.MOX_RAG_TIMEOUT_MS || 10000),
-		},
+		// Word-based chunking parameters
+		chunkSize: Number(process.env.RAG_CHUNK_SIZE || 400),
+		chunkOverlap: Number(process.env.RAG_CHUNK_OVERLAP || 50),
+		// Cosine similarity threshold (0–1); lower = more permissive (0.40 is a safe default for Vertex AI)
+		similarityThreshold: Number(process.env.RAG_SIMILARITY_THRESHOLD || 0.40),
+		// Embedding model — text-embedding-004 is the Vertex AI model (768-dim, same as MoxVoice)
+		embeddingModel: process.env.RAG_EMBEDDING_MODEL || "text-embedding-004",
 	},
 
 	rulesGrounding: {

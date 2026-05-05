@@ -36,6 +36,8 @@ const EVENT_KEYWORDS = ["event", "fnm", "draft", "prerelease", "commander night"
 const VOUCHER_KEYWORDS = ["voucher", "promo code", "coupon", "discount code", "gift card"];
 const SUPPORT_KEYWORDS = ["support", "issue", "problem", "damaged", "missing", "wrong item", "need help"];
 const PRODUCT_KEYWORDS = ["product", "stock", "available", "price", "booster", "box", "bundle", "single", "card", "sleeves", "playmat", "deck box"];
+const FAQ_KEYWORDS = ["faq", "frequently asked", "how do i", "how does", "what is", "can i", "do you", "when do", "opening hours", "contact", "email", "phone number"];
+const SHIPPING_KEYWORDS = ["shipping", "delivery", "ship", "deliver", "postage", "courier", "dispatch", "free shipping", "tracking"];
 const UNSUPPORTED_ACTION_KEYWORDS = ["place order", "buy this", "reserve this", "hold this for me", "register me", "sign me up"];
 const IMAGE_KEYWORDS = ["picture", "pictures", "image", "images", "photo", "photos", "pic", "pics", "artwork", "art of"];
 const CARD_TYPE_HINTS = ["artifact", "battle", "creature", "enchantment", "instant", "land", "planeswalker", "sorcery", "legendary", "mythic", "rare", "uncommon", "common"];
@@ -130,7 +132,7 @@ function shouldUseProductLookupFlow(originalText, normalizedText, history = []) 
 		return false;
 	}
 
-	return looksLikeProductLookup(originalText, normalizedText) || includesAny(normalizedText, DIRECT_PRODUCT_HINTS);
+	return includesAny(normalizedText, DIRECT_PRODUCT_HINTS) || includesAny(normalizedText, PRODUCT_KEYWORDS);
 }
 
 function detectRoute(originalText, normalizedText, history = []) {
@@ -147,11 +149,23 @@ function detectRoute(originalText, normalizedText, history = []) {
 	}
 
 	if (includesAny(normalizedText, BUYLIST_KEYWORDS)) {
-		return { type: "rag", category: "buylist" };
+		return { type: "rag" };
 	}
 
 	if (includesAny(normalizedText, POLICY_KEYWORDS)) {
-		return { type: "rag", category: "policies" };
+		return { type: "rag" };
+	}
+
+	if (includesAny(normalizedText, SHIPPING_KEYWORDS)) {
+		return { type: "rag" };
+	}
+
+	if (includesAny(normalizedText, FAQ_KEYWORDS)) {
+		return { type: "rag" };
+	}
+
+	if (includesAny(normalizedText, EVENT_KEYWORDS)) {
+		return { type: "rag" };
 	}
 
 	if (includesAny(normalizedText, RULES_KEYWORDS)) {
@@ -164,11 +178,11 @@ function detectRoute(originalText, normalizedText, history = []) {
 
 	if (
 		includesAny(normalizedText, EVENT_KEYWORDS)
+		includesAny(normalizedText, ORDER_STATUS_KEYWORDS)
 		|| includesAny(normalizedText, VOUCHER_KEYWORDS)
 		|| includesAny(normalizedText, SUPPORT_KEYWORDS)
 		|| includesAny(normalizedText, PRODUCT_KEYWORDS)
 		|| includesAny(normalizedText, DIRECT_PRODUCT_HINTS)
-		|| looksLikeProductLookup(originalText, normalizedText)
 	) {
 		return { type: "store_tools" };
 	}
@@ -393,7 +407,7 @@ function getRecentLikelyProductMessages(history = [], limit = 4) {
 	return history
 		.filter((entry) => entry?.role === "user" && hasDisplayValue(entry.content))
 		.map((entry) => entry.content)
-		.filter((content) => looksLikeProductLookup(content, content.toLowerCase()) || includesAny(content.toLowerCase(), DIRECT_PRODUCT_HINTS))
+		.filter((content) => includesAny(content.toLowerCase(), DIRECT_PRODUCT_HINTS) || includesAny(content.toLowerCase(), PRODUCT_KEYWORDS))
 		.slice(-limit);
 }
 
@@ -1111,10 +1125,10 @@ async function handleOrderStatusRoute(text, history) {
 	return formatStoreToolReply({ toolExecutions: [fallbackExecution] }, text);
 }
 
-async function handleRagRoute(text, history, category) {
-	const retrieval = await ragService.retrieveKnowledge(text, category);
-	if (!retrieval.matches.length) {
-		return `I could not find ${category} guidance in the local knowledge base. Please contact store staff for a confirmed answer.`;
+async function handleRagRoute(text, history) {
+	const retrieval = await ragService.retrieveKnowledge(text);
+	if (!retrieval.matches || !retrieval.matches.length) {
+		return "I could not find guidance on this topic in the local knowledge base. Please contact store staff for a confirmed answer.";
 	}
 
 	const context = retrieval.matches
@@ -1125,7 +1139,6 @@ async function handleRagRoute(text, history, category) {
 		"Answer the user using only the supplied knowledge snippets.",
 		"Be concise and store-support focused.",
 		"If the snippets are incomplete, say that the answer needs staff confirmation.",
-		`Knowledge category: ${category}`,
 		"",
 		context,
 		"",
@@ -1138,7 +1151,7 @@ async function handleRagRoute(text, history, category) {
 		message: prompt,
 	});
 
-	return response.text || `Here is the closest ${category} guidance I found:\n\n${context}`;
+	return response.text || `Here is the closest guidance I found:\n\n${context}`;
 }
 
 async function handleStoreToolsRoute(text, history, context) {
@@ -1205,8 +1218,35 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 	}
 
 	const normalizedText = cleanedText.toLowerCase();
+	let route = detectRoute(cleanedText, normalizedText);
 	const history = getHistory(chatId);
 	const route = detectRoute(cleanedText, normalizedText, history);
+
+	// AI Intent Classification for ambiguous queries
+	if (route.type === "out_of_scope") {
+		try {
+			const intentClassification = await llmService.generateJson({
+				systemInstruction: [
+					"You classify customer intent for an MTG store bot.",
+					"Return JSON only: {'intent': 'product_lookup' | 'store_faq' | 'out_of_scope'}",
+					"If asking to buy, check stock, or find specific MTG cards, sealed products, or accessories, use 'product_lookup'.",
+					"If asking about store founders, hours, location, vision, return policy, or general questions, use 'store_faq'.",
+					"If conversational or unrelated, use 'out_of_scope'."
+				].join("\n"),
+				history: [],
+				message: `Classify this message: "${cleanedText}"`
+			});
+			
+			const intent = intentClassification?.data?.intent;
+			if (intent === "product_lookup") {
+				route = { type: "store_tools" };
+			} else if (intent === "store_faq") {
+				route = { type: "rag" };
+			}
+		} catch (error) {
+			console.error("Error classifying intent:", error);
+		}
+	}
 
 	let reply;
 	if (route.type === "greeting") {
@@ -1218,7 +1258,7 @@ async function processMessage({ chatId, messageText, customerInfo }) {
 	} else if (route.type === "image_redirect") {
 		reply = handleImageRedirect();
 	} else if (route.type === "rag" && runtimeConfig.features.rag.enabled) {
-		reply = await handleRagRoute(cleanedText, history, route.category);
+		reply = await handleRagRoute(cleanedText, history);
 	} else if (route.type === "rules") {
 		reply = await handleRulesRoute(cleanedText);
 	} else if (route.type === "order_status" && runtimeConfig.features.tools.enabled) {
