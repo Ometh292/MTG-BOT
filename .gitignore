@@ -51,6 +51,7 @@ google_calendar_credentials.json
 *.p12
 credentials.json
 token.json
+service-account-key.json
 
 # Build & Distribution
 dist/
@@ -61,6 +62,11 @@ build/
 tmp/
 temp/
 *.tmp
+scratch/
+
+# RAG Data
+rag/.vector-index/
+rag/.rag-manifest.json
 
 # Test Coverage
 coverage/

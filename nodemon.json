@@ -2,16 +2,18 @@
     "watch": [
         "index.js",
         "config.js",
-        "history.js"
+        "history.js",
+        "src/"
     ],
+    "ext": "js",
     "ignore": [
         ".wwebjs_auth/**",
         ".wwebjs_cache/**",
         "node_modules/**",
+        "rag/.vector-index/**",
         "nodemon.json",
         "package.json",
         "package-lock.json",
         "*.log"
-    ],
-    "ext": "js"
+    ]
 }

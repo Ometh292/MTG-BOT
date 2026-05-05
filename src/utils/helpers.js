@@ -27,6 +27,8 @@ function normalizeOrderCode(value) {
 
 function safeTextCleanup(value) {
 	return String(value || "")
+		// Remove WhatsApp-style metadata if present at the start: "[00:08, 05/05/2026] +94 75 032 9795: "
+		.replace(/^\[?\d{2}:\d{2},? \d{2}\/\d{2}\/\d{4}\]? [^:]+: /, "")
 		.replace(/[\u200B-\u200D\uFEFF]/g, "")
 		.replace(/\s+/g, " ")
 		.trim();

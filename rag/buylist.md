@@ -1,19 +1,15 @@
-Buylist Overview
+# Mox & Lotus SG
 
-The store buylist covers selected singles, staples, Commander cards, and some sealed products in saleable condition. Large collections usually require manual review before a final quote is issued.
+Buylist Update
 
-Condition Expectations
+# Buylist Closed for Spring Cleaning
 
-Cards should be sorted and described as accurately as possible. Condition, language, printing, and authenticity all affect the quote. Heavily played or damaged cards may be declined or quoted at a lower rate.
+✨ A quick update from us! ✨
 
-Quote Process
+Edited: 30 March 2026. We originally hoped to have everything ready for you within a week ago, but as we dove deeper, we realized we could make things even better!
 
-WhatsApp can explain the process, but final buylist quotes are confirmed by staff after review. Customers should include card names, quantities, set or printing information where relevant, and clear photos for higher-value items.
+To ensure top-tier accuracy and faster loading times, we’ve decided to put in an extra bit of polish for our annual maintenance.
 
-Payout Options
+Our hardworking bunnies are hopping along to get everything just right, so we’re asking for your patience for one more week. We are aiming to cross the finish line by 8 - 10 May 2026 weekend.
 
-The store may offer either cash or store credit depending on the item mix and current demand. Store credit is often higher than cash, but the final spread depends on staff review.
-
-Bulk Cards
-
-Bulk commons and uncommons may be accepted only during selected intake windows. Customers should ask before bringing large unsorted lots.
+Thank you so much for your incredible love and support—and we appreciate your patience! ✨
