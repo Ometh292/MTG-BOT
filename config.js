@@ -10,6 +10,44 @@ function parseBoolean(value, fallback = false) {
 	return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
+function parseDurationMs(value, fallback = 10000) {
+	if (value === undefined || value === null || value === "") {
+		return fallback;
+	}
+
+	const raw = String(value).trim().toLowerCase();
+	if (!raw) {
+		return fallback;
+	}
+
+	const parseNumeric = (text) => {
+		const number = Number(text);
+		return Number.isFinite(number) && number > 0 ? number : null;
+	};
+
+	if (/^\d+(?:\.\d+)?\s*ms$/.test(raw)) {
+		const valueMs = parseNumeric(raw.replace(/\s*ms$/, ""));
+		return valueMs ? Math.round(valueMs) : fallback;
+	}
+
+	if (/^\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)$/.test(raw)) {
+		const valueSeconds = parseNumeric(raw.replace(/\s*(?:s|sec|secs|second|seconds)$/, ""));
+		return valueSeconds ? Math.round(valueSeconds * 1000) : fallback;
+	}
+
+	if (/^\d+(?:\.\d+)?$/.test(raw)) {
+		const numeric = parseNumeric(raw);
+		if (!numeric) {
+			return fallback;
+		}
+
+		// Backward compatibility: values like "30" were often provided as seconds.
+		return numeric <= 120 ? Math.round(numeric * 1000) : Math.round(numeric);
+	}
+
+	return fallback;
+}
+
 function getDefaultPuppeteerArgs() {
 	const baseArgs = [
 		"--no-sandbox",
@@ -32,8 +70,8 @@ function getDefaultPuppeteerArgs() {
 
 module.exports = {
 	storeInfo: {
-		name: "Mana Junction MTG Store",
-		location: "Colombo, Sri Lanka",
+		name: "Mox & Lotus SG",
+		location: "Bedok North, Singapore",
 		supportHours: "Tuesday-Sunday, 11:00 AM-8:00 PM",
 		timezone: process.env.STORE_TIMEZONE || "Asia/Colombo",
 		contactEmail: process.env.STORE_SUPPORT_EMAIL || "support@manajunction.example",
@@ -44,6 +82,17 @@ module.exports = {
 		enabled: true,
 		provider: "gemini",
 		model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+		auth: {
+			mode: String(process.env.GEMINI_AUTH_MODE || "auto").trim().toLowerCase(),
+			apiKey: process.env.GEMINI_API_KEY || "",
+			vertexAi: {
+				enabled: parseBoolean(process.env.GEMINI_USE_VERTEX_AI, false),
+				project: process.env.GOOGLE_CLOUD_PROJECT || "",
+				location: process.env.GOOGLE_CLOUD_LOCATION || "",
+				applicationCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS || "",
+				apiVersion: process.env.GEMINI_VERTEX_API_VERSION || "",
+			},
+		},
 		systemPrompt: getSystemPrompt(),
 		memory: {
 			enabled: true,
@@ -57,6 +106,8 @@ module.exports = {
 		},
 		rag: {
 			enabled: parseBoolean(process.env.RAG_ENABLED, true),
+			crawlOnStartup: parseBoolean(process.env.RAG_CRAWL_ENABLED, true),
+			scheduleDailyCrawl: parseBoolean(process.env.RAG_DAILY_CRAWL_ENABLED, true),
 		},
 		rulesGrounding: {
 			enabled: parseBoolean(process.env.RULES_GROUNDING_ENABLED, false),
@@ -68,16 +119,47 @@ module.exports = {
 		apiKey: process.env.STORE_API_KEY || "",
 		timeoutMs: Number(process.env.STORE_API_TIMEOUT_MS || 10000),
 	},
+	productApi: {
+		baseUrl: process.env.PRODUCT_API_BASE_URL
+			|| process.env.CARD_API_BASE_URL
+			|| process.env.STORE_PRODUCT_API_BASE_URL
+			|| "https://api.mtg.cardnoble.cloud"
+			|| "",
+		searchPath: process.env.PRODUCT_API_SEARCH_PATH || "/cards/search",
+		timeoutMs: parseDurationMs(
+			process.env.PRODUCT_API_TIMEOUT_MS
+			|| process.env.PRODUCT_API_TIMEOUT
+			|| process.env.STORE_API_TIMEOUT_MS,
+			10000,
+		),
+		defaultLimit: Number(process.env.PRODUCT_API_LIMIT || 24),
+		maxUserVisibleResults: Number(process.env.PRODUCT_API_MAX_VISIBLE_RESULTS || 6),
+		maxSearchCandidates: Number(process.env.PRODUCT_API_MAX_SEARCH_CANDIDATES || 5),
+		maxRetries: Number(process.env.PRODUCT_API_MAX_RETRIES || 2),
+		retryDelayMs: parseDurationMs(process.env.PRODUCT_API_RETRY_DELAY_MS || "500ms", 500),
+	},
+	moxApi: {
+		baseUrl: process.env.MOX_API_BASE_URL || "",
+		username: process.env.MOX_API_USERNAME || "",
+		password: process.env.MOX_API_PASSWORD || "",
+		userType: process.env.MOX_API_USER_TYPE || "Customer",
+		timeoutMs: parseDurationMs(process.env.MOX_API_TIMEOUT, 10000),
+	},
 
 	rag: {
+		// Folder containing .md knowledge files (auto-indexed on startup)
 		sourcePath: process.env.RAG_SOURCE_PATH || path.join(__dirname, "rag"),
-		categories: ["policies", "buylist"],
+		// Local vectra vector-index storage directory
+		indexPath: process.env.RAG_INDEX_PATH || path.join(__dirname, "rag", ".vector-index"),
+		categories: ["policies", "buylist", "faq", "shipping", "events", "general"],
 		maxResults: Number(process.env.RAG_MAX_RESULTS || 3),
-		remote: {
-			baseUrl: process.env.MOX_RAG_BASE_URL || "http://localhost:8000",
-			tenantId: process.env.MOX_RAG_TENANT_ID || "default",
-			timeoutMs: Number(process.env.MOX_RAG_TIMEOUT_MS || 10000),
-		},
+		// Word-based chunking parameters
+		chunkSize: Number(process.env.RAG_CHUNK_SIZE || 400),
+		chunkOverlap: Number(process.env.RAG_CHUNK_OVERLAP || 50),
+		// Cosine similarity threshold (0–1); lower = more permissive (0.40 is a safe default for Vertex AI)
+		similarityThreshold: Number(process.env.RAG_SIMILARITY_THRESHOLD || 0.40),
+		// Embedding model — text-embedding-004 is the Vertex AI model (768-dim, same as MoxVoice)
+		embeddingModel: process.env.RAG_EMBEDDING_MODEL || "text-embedding-004",
 	},
 
 	rulesGrounding: {

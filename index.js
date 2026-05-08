@@ -5,7 +5,9 @@ const HistoryManager = require("./history");
 const whatsappService = require("./src/services/whatsapp");
 const geminiService = require("./src/services/gemini");
 const agentService = require("./src/services/agent");
+const ragService = require("./src/services/rag");
 const expressService = require("./src/services/express");
+const crawlerService = require("./src/services/crawler");
 
 function isTransientWhatsAppInitError(error) {
 	const message = String(error && error.message ? error.message : error);
@@ -56,8 +58,39 @@ async function bootstrap() {
 		console.log(`Session memory enabled (limit: ${config.aiBot.memory.limit} messages)`);
 	}
 
-	await geminiService.initialize(process.env.GEMINI_API_KEY, config);
+	await geminiService.initialize(config);
+	console.log(`Gemini auth mode: ${geminiService.getActiveAuthMode()}`);
 	agentService.initialize({ config, historyManager, geminiService });
+
+	// Crawl website first to update rag/*.md files, then build the vector index
+	if (config.features.rag.enabled) {
+		if (config.features.rag.crawlOnStartup) {
+			// Step 1: Crawl website and refresh Markdown knowledge files
+			console.log("Crawling moxandlotus.sg to refresh knowledge base...\n");
+			try {
+				const crawlResult = await crawlerService.runCrawler();
+				console.log(`Crawl complete: ${crawlResult.savedCount} pages updated.\n`);
+			} catch (crawlError) {
+				console.warn("[Crawler] Website crawl failed (will use existing rag/*.md files):", crawlError.message);
+			}
+		} else {
+			console.log("Startup crawler is disabled. Using existing rag/*.md files.\n");
+		}
+
+		// Step 2: Build (or rebuild) the vector index from existing rag/*.md
+		console.log("Building RAG knowledge index...\n");
+		try {
+			await ragService.buildIndex();
+			console.log("RAG index ready.\n");
+		} catch (ragError) {
+			console.warn("[RAG] Index build failed (bot will start without RAG):", ragError.message);
+		}
+
+		if (config.features.rag.scheduleDailyCrawl) {
+			// Step 3: Schedule daily crawl + index rebuild (runs at midnight Colombo time)
+			crawlerService.scheduleDaily(0, 0, ragService);
+		}
+	}
 
 	const client = whatsappService.initializeClient(config, {
 		agentService,
